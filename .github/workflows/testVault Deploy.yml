@@ -50,9 +50,9 @@ jobs:
       # Check Repository Structure
       # ======================================
 
-      - name: Check Repository Structure
+     - name: Check Repository Structure
 
-        shell: powershell
+       shell: powershell
 
        run: |
 
@@ -702,4 +702,3 @@ jobs:
               }
 
           }
-          
