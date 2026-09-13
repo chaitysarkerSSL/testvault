@@ -1,0 +1,670 @@
+name: Deploy TestVault IIS
+
+on:
+  push:
+    branches:
+      - main
+
+# Prevent two deployments from running at the same time
+concurrency:
+  group: testvault-deployment
+  cancel-in-progress: false
+
+jobs:
+
+  deploy:
+
+    runs-on: self-hosted
+
+    env:
+
+      APP_NAME: TestVault
+
+      BASE_PATH: E:\AllWebApplication\TestVault
+
+      RELEASE_PATH: E:\AllWebApplication\TestVault\Releases
+
+      CURRENT_PATH: E:\AllWebApplication\TestVault\Current
+
+      BACKUP_PATH: E:\AllWebApplication\TestVault\Backup
+      
+      SOLUTION_FILE: SSL_ERP.sln
+
+      PROJECT_FILE: SSL_ERP\SSL_ERP.csproj
+
+      HEALTH_URL: http://localhost/
+
+
+    steps:
+
+      # ======================================
+      # Checkout
+      # ======================================
+
+      - name: Checkout Code
+
+        uses: actions/checkout@v4
+
+        with:
+          fetch-depth: 1
+
+
+      # ======================================
+      # Environment Check
+      # ======================================
+
+      - name: Environment Check
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Environment Check"
+          Write-Host "======================================"
+
+
+          $dotnet = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+
+
+          if ($null -eq $dotnet)
+          {
+              throw ".NET SDK executable not found"
+          }
+
+
+          Write-Host "dotnet path:"
+          Write-Host $dotnet.Source
+
+
+          $version = dotnet --version
+
+
+          if ($LASTEXITCODE -ne 0)
+          {
+              throw ".NET SDK is not available"
+          }
+
+
+          Write-Host ".NET SDK Version:"
+          Write-Host $version
+
+
+          Write-Host ".NET environment OK"
+
+
+      # ======================================
+      # Verify Solution and Project
+      # ======================================
+
+      - name: Verify Project Files
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "Checking solution and project files"
+
+
+          $solution =
+            Join-Path `
+              "${{ github.workspace }}" `
+              "${{ env.SOLUTION_FILE }}"
+
+
+          $project =
+            Join-Path `
+              "${{ github.workspace }}" `
+              "${{ env.PROJECT_FILE }}"
+
+
+          if (!(Test-Path $solution))
+          {
+              throw "Solution not found: $solution"
+          }
+
+
+          if (!(Test-Path $project))
+          {
+              throw "Project not found: $project"
+          }
+
+
+          "SOLUTION=$solution" >> $env:GITHUB_ENV
+
+          "PROJECT=$project" >> $env:GITHUB_ENV
+
+
+          Write-Host "Solution Found:"
+          Write-Host $solution
+
+
+          Write-Host "Project Found:"
+          Write-Host $project
+
+
+      # ======================================
+      # Restore
+      # ======================================
+
+      - name: Restore NuGet Packages
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Restoring NuGet Packages"
+          Write-Host "======================================"
+
+
+          dotnet restore "${{ env.SOLUTION }}"
+
+
+          if ($LASTEXITCODE -ne 0)
+          {
+              throw "NuGet Restore Failed"
+          }
+
+
+          Write-Host "Restore Completed Successfully"
+
+
+      # ======================================
+      # Build
+      # ======================================
+
+      - name: Build Application
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Building Application"
+          Write-Host "======================================"
+
+
+          dotnet build "${{ env.SOLUTION }}" `
+            --configuration Release `
+            --no-restore
+
+
+          if ($LASTEXITCODE -ne 0)
+          {
+              throw "Build Failed"
+          }
+
+
+          Write-Host "Build Completed Successfully"
+
+
+      # ======================================
+      # Prepare Deployment Directories
+      # ======================================
+
+      - name: Prepare Deployment Directories
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "Preparing deployment directories"
+
+
+          New-Item `
+            -ItemType Directory `
+            -Path "${{ env.BASE_PATH }}" `
+            -Force |
+            Out-Null
+
+
+          New-Item `
+            -ItemType Directory `
+            -Path "${{ env.RELEASE_PATH }}" `
+            -Force |
+            Out-Null
+
+
+          New-Item `
+            -ItemType Directory `
+            -Path "${{ env.CURRENT_PATH }}" `
+            -Force |
+            Out-Null
+
+
+          New-Item `
+            -ItemType Directory `
+            -Path "${{ env.BACKUP_PATH }}" `
+            -Force |
+            Out-Null
+
+
+          Write-Host "Deployment directories ready"
+
+
+      # ======================================
+      # Create Release Folder
+      # ======================================
+
+      - name: Create New Release
+
+        shell: powershell
+
+        run: |
+
+          $releaseName =
+            "Release_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+
+
+          $releasePath =
+            Join-Path `
+              "${{ env.RELEASE_PATH }}" `
+              $releaseName
+
+
+          New-Item `
+            -ItemType Directory `
+            -Path $releasePath `
+            -Force |
+            Out-Null
+
+
+          "NEW_RELEASE=$releasePath" >> $env:GITHUB_ENV
+
+
+          Write-Host "Release Created:"
+          Write-Host $releasePath
+
+
+      # ======================================
+      # Publish Application
+      # ======================================
+
+      - name: Publish Application
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Publishing Application"
+          Write-Host "======================================"
+
+
+          dotnet publish "${{ env.PROJECT }}" `
+            --configuration Release `
+            --output "${{ env.NEW_RELEASE }}" `
+            --no-build
+
+
+          if ($LASTEXITCODE -ne 0)
+          {
+              throw "Publish Failed"
+          }
+
+
+          $publishedFiles =
+            Get-ChildItem `
+              "${{ env.NEW_RELEASE }}" `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+
+          if ($null -eq $publishedFiles -or $publishedFiles.Count -eq 0)
+          {
+              throw "Published release folder is empty"
+          }
+
+
+          if (!(Test-Path "${{ env.NEW_RELEASE }}\web.config"))
+          {
+              throw "web.config was not found in published output"
+          }
+
+
+          Write-Host "Publish Completed Successfully"
+
+
+          Write-Host "Release Package:"
+          Write-Host "${{ env.NEW_RELEASE }}"
+
+
+      # ======================================
+      # Backup Current Version
+      # ======================================
+
+      - name: Backup Current Version
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Backing Up Current Version"
+          Write-Host "======================================"
+
+
+          $current =
+            "${{ env.CURRENT_PATH }}"
+
+
+          $items =
+            Get-ChildItem `
+              $current `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+
+          if ($null -ne $items -and $items.Count -gt 0)
+          {
+
+              $backupName =
+                "Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+
+
+              $backupPath =
+                Join-Path `
+                  "${{ env.BACKUP_PATH }}" `
+                  $backupName
+
+
+              New-Item `
+                -ItemType Directory `
+                -Path $backupPath `
+                -Force |
+                Out-Null
+
+
+              Copy-Item `
+                "$current\*" `
+                $backupPath `
+                -Recurse `
+                -Force
+
+
+              "OLD_BACKUP=$backupPath" >> $env:GITHUB_ENV
+
+
+              Write-Host "Backup Created:"
+              Write-Host $backupPath
+
+          }
+          else
+          {
+
+              Write-Host "Current folder is empty."
+
+              Write-Host "Backup skipped."
+
+          }
+
+
+      # ======================================
+      # Deploy Release → Current
+      # ======================================
+
+      - name: Deploy Release
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Deploying Release"
+          Write-Host "======================================"
+
+
+          $current =
+            "${{ env.CURRENT_PATH }}"
+
+
+          $release =
+            "${{ env.NEW_RELEASE }}"
+
+
+          $offlineFile =
+            Join-Path `
+              $current `
+              "app_offline.htm"
+
+
+          Write-Host "Current Path:"
+          Write-Host $current
+
+
+          Write-Host "Release Path:"
+          Write-Host $release
+
+
+          # --------------------------------------
+          # Take Application Offline
+          # --------------------------------------
+
+          Write-Host "Taking application offline"
+
+
+          Set-Content `
+            -Path $offlineFile `
+            -Value "Application is temporarily unavailable. Please try again shortly." `
+            -Encoding UTF8
+
+
+          # Give ASP.NET Core time to shut down
+          Start-Sleep -Seconds 15
+
+
+          # --------------------------------------
+          # Remove Previous Application
+          # --------------------------------------
+
+          Write-Host "Removing previous application files"
+
+
+          Get-ChildItem `
+            $current `
+            -Force |
+          Where-Object {
+            $_.Name -ne "app_offline.htm"
+          } |
+          Remove-Item `
+            -Recurse `
+            -Force
+
+
+          # --------------------------------------
+          # Copy New Release
+          # --------------------------------------
+
+          Write-Host "Copying new release to Current"
+
+
+          Copy-Item `
+            "$release\*" `
+            $current `
+            -Recurse `
+            -Force
+
+
+          # --------------------------------------
+          # Verify Deployment
+          # --------------------------------------
+
+          if (!(Test-Path "$current\web.config"))
+          {
+              throw "Deployment verification failed: web.config not found"
+          }
+
+
+          # --------------------------------------
+          # Bring Application Online
+          # --------------------------------------
+
+          Write-Host "Bringing application online"
+
+
+          if (Test-Path $offlineFile)
+          {
+              Remove-Item `
+                $offlineFile `
+                -Force
+          }
+
+
+          Write-Host "Deployment Completed Successfully"
+
+
+      # ======================================
+      # Health Check
+      # ======================================
+
+      - name: Application Health Check
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "======================================"
+          Write-Host "Application Health Check"
+          Write-Host "======================================"
+
+
+          Start-Sleep -Seconds 20
+
+
+          Write-Host "Checking URL:"
+          Write-Host "${{ env.HEALTH_URL }}"
+
+
+          try
+          {
+
+              $response =
+                Invoke-WebRequest `
+                  -Uri "${{ env.HEALTH_URL }}" `
+                  -UseBasicParsing `
+                  -TimeoutSec 30
+
+
+              Write-Host "HTTP Status:"
+              Write-Host $response.StatusCode
+
+
+              if ($response.StatusCode -lt 200 -or
+                  $response.StatusCode -ge 400)
+              {
+                  throw `
+                    "Unexpected HTTP Status: $($response.StatusCode)"
+              }
+
+
+              Write-Host "======================================"
+              Write-Host "Application Healthy"
+              Write-Host "======================================"
+
+          }
+          catch
+          {
+
+              Write-Host "Health Check Failed"
+
+              Write-Host $_.Exception.Message
+
+              throw `
+                "Application Health Check Failed"
+
+          }
+
+
+      # ======================================
+      # Cleanup Old Releases
+      # Keep Latest 5
+      # ======================================
+
+      - name: Cleanup Old Releases
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "Cleaning old releases"
+
+
+          if (Test-Path "${{ env.RELEASE_PATH }}")
+          {
+
+              $releases =
+                Get-ChildItem `
+                  "${{ env.RELEASE_PATH }}" `
+                  -Directory |
+                Sort-Object CreationTime -Descending
+
+
+              if ($releases.Count -gt 5)
+              {
+
+                  $releases |
+                    Select-Object -Skip 5 |
+                    Remove-Item `
+                      -Recurse `
+                      -Force
+
+
+                  Write-Host "Old releases removed."
+
+              }
+              else
+              {
+
+                  Write-Host "No old releases to remove."
+
+              }
+
+          }
+
+
+      # ======================================
+      # Cleanup Old Backups
+      # Keep Latest 5
+      # ======================================
+
+      - name: Cleanup Old Backups
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "Cleaning old backups"
+
+
+          if (Test-Path "${{ env.BACKUP_PATH }}")
+          {
+
+              $backups =
+                Get-ChildItem `
+                  "${{ env.BACKUP_PATH }}" `
+                  -Directory |
+                Sort-Object CreationTime -Descending
+
+
+              if ($backups.Count -gt 5)
+              {
+
+                  $backups |
+                    Select-Object -Skip 5 |
+                    Remove-Item `
+                      -Recurse `
+                      -Force
+
+
+                  Write-Host "Old backups removed."
+
+              }
+              else
+              {
+
+                  Write-Host "No old backups to remove."
+
+              }
+
+          }
