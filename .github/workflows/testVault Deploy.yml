@@ -28,10 +28,6 @@ jobs:
 
       BACKUP_PATH: E:\AllWebApplication\TestVault\Backup
       
-      SOLUTION_FILE: SSL_ERP.sln
-
-      PROJECT_FILE: SSL_ERP\SSL_ERP.csproj
-
       HEALTH_URL: http://localhost/
 
 
@@ -58,17 +54,34 @@ jobs:
 
         shell: powershell
 
-        run: |
+       run: |
 
-          Write-Host "Repository Files"
+          Write-Host "Workspace:"
+          Write-Host "${{ github.workspace }}"
 
-          Get-ChildItem "${{ github.workspace }}" -Recurse -Filter *.sln
+
+          Write-Host "All Files and Folders"
+
+          Get-ChildItem "${{ github.workspace }}" -Depth 3
 
 
-          Write-Host "Projects"
+          Write-Host "Solution Files"
 
-          Get-ChildItem "${{ github.workspace }}" -Recurse -Filter *.csproj
+          Get-ChildItem `
+          "${{ github.workspace }}" `
+          -Recurse `
+          -Include *.sln `
+          -ErrorAction SilentlyContinue
 
+
+          Write-Host "Project Files"
+
+          Get-ChildItem `
+          "${{ github.workspace }}" `
+          -Recurse `
+          -Include *.csproj `
+          -ErrorAction SilentlyContinue
+          
 
       # ======================================
       # Environment Check
