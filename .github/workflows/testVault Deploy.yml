@@ -49,6 +49,27 @@ jobs:
           fetch-depth: 1
 
 
+
+      # ======================================
+      # Check Repository Structure
+      # ======================================
+
+      - name: Check Repository Structure
+
+        shell: powershell
+
+        run: |
+
+          Write-Host "Repository Files"
+
+          Get-ChildItem "${{ github.workspace }}" -Recurse -Filter *.sln
+
+
+          Write-Host "Projects"
+
+          Get-ChildItem "${{ github.workspace }}" -Recurse -Filter *.csproj
+
+
       # ======================================
       # Environment Check
       # ======================================
