@@ -253,7 +253,9 @@ jobs:
 
           # dotnet publish generates web.config automatically for
           # Microsoft.NET.Sdk.Web projects - this is what wires up ANCM
-          # inside IIS, and what the next step edits to inject secrets.
+          # inside IIS, and what the next step sets ASPNETCORE_ENVIRONMENT
+          # in (secrets themselves come from the server's Application Pool
+          # environment, not from this file - see that step's header).
           if (!(Test-Path "${{ env.NEW_RELEASE }}\web.config")) {
               throw "web.config was not found in published output. Confirm the web project targets Microsoft.NET.Sdk.Web."
           }
@@ -265,41 +267,58 @@ jobs:
       # ======================================
       # Configure Environment Variables
       #
-      # Production secrets never live in this repository (appsettings.json
-      # ships only empty placeholders - see TestVault.Web/appsettings*.json's
-      # own "// NOTE" entries). They're injected here, straight from GitHub
-      # Actions secrets into the just-published release's web.config
-      # <aspNetCore><environmentVariables> section - ANCM passes these
-      # through to the .NET process as real environment variables, which is
-      # exactly how TestVault.Web already expects to receive them
-      # (ConnectionStrings__DefaultConnection / Jwt__Secret / AI__ApiKey -
-      # double underscore is ASP.NET Core configuration's own convention for
-      # a nested key, e.g. Jwt:Secret).
+      # PRODUCTION CONFIGURATION LIVES ON THE SERVER, NOT IN GITHUB.
       #
-      # The values themselves only ever exist: (a) in GitHub's encrypted
-      # secret store, (b) transiently in this step's process memory, and
-      # (c) in the deployed web.config on the server's disk (never in git -
-      # Releases/ is server-local, outside the repository). GitHub
-      # Actions masks all three in this job's logs because they're
-      # referenced via `secrets.` below.
+      # ConnectionStrings__DefaultConnection, Jwt__Secret and AI__ApiKey are
+      # NOT read from GitHub Actions secrets and are NOT written into
+      # web.config by this workflow. This repository never holds a real
+      # connection string, JWT secret or API key (see TestVault.Web/
+      # appsettings*.json's own "// NOTE" entries) - and since `dotnet
+      # publish` above regenerates a brand-new web.config on every single
+      # deployment, anything this step wrote into it would only live as
+      # long as the next release anyway. A value that must survive across
+      # deployments has to live somewhere `dotnet publish` never touches:
+      # the IIS Application Pool itself.
+      #
+      # >>> ONE-TIME SERVER SETUP (do this on the IIS box, not in CI) <<<
+      # Set these as environment variables on the "${{ env.IIS_APP_POOL }}"
+      # Application Pool (IIS 10 / Windows Server 2016+ feature - the ASP.NET
+      # Core Module (ANCM) launches w3wp.exe with these already in its
+      # process environment, so TestVault.Web picks them up exactly like any
+      # other environment variable - no web.config entry required):
+      #
+      #   Import-Module WebAdministration
+      #   $pool = "${{ env.IIS_APP_POOL }}"
+      #   foreach ($kv in @{
+      #       'ConnectionStrings__DefaultConnection' = '<real SQL Server connection string>'
+      #       'Jwt__Secret'                          = '<random, 32+ chars - see Program.cs>'
+      #       'AI__ApiKey'                            = '<Anthropic API key - optional>'
+      #   }.GetEnumerator()) {
+      #       Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+      #           -Filter "system.applicationHost/applicationPools/add[@name='$pool']/environmentVariables" `
+      #           -Name "." -Value @{ name = $kv.Key; value = $kv.Value }
+      #   }
+      #   Restart-WebAppPool -Name $pool
+      #
+      # Equivalent GUI path: IIS Manager -> Application Pools -> select the
+      # pool -> Configuration Editor -> section
+      # system.applicationHost/applicationPools -> find this pool's entry ->
+      # environmentVariables -> Add. See docs/DEPLOYMENT.md §4 for the full
+      # walkthrough, including how to update/rotate a value later.
+      #
+      # This step only ever sets ASPNETCORE_ENVIRONMENT, which is not a
+      # secret and is the same for every deployment - it belongs in
+      # web.config (it's what makes TestVault.Web load
+      # appsettings.Production.json at all) and has no reason to be
+      # maintained by hand on the server.
       # ======================================
 
       - name: Configure Environment Variables
         shell: powershell
-        env:
-          DEPLOY_CONNECTION_STRING: ${{ secrets.TESTVAULT_CONNECTION_STRING }}
-          DEPLOY_JWT_SECRET: ${{ secrets.TESTVAULT_JWT_SECRET }}
-          DEPLOY_AI_API_KEY: ${{ secrets.TESTVAULT_AI_API_KEY }}
         run: |
           Write-Host "======================================"
           Write-Host "Configuring Environment Variables"
           Write-Host "======================================"
-
-          foreach ($name in @('DEPLOY_CONNECTION_STRING', 'DEPLOY_JWT_SECRET')) {
-              if ([string]::IsNullOrWhiteSpace((Get-Item "Env:$name" -ErrorAction SilentlyContinue).Value)) {
-                  throw "Required secret is not configured: $name. Set it under this repository's Settings -> Secrets and variables -> Actions before deploying. (AI__ApiKey is optional - only required if AI failure analysis is used.)"
-              }
-          }
 
           $webConfigPath = Join-Path "${{ env.NEW_RELEASE }}" "web.config"
           [xml]$webConfig = Get-Content $webConfigPath
@@ -334,16 +353,45 @@ jobs:
               $existing.SetAttribute("value", $Value) | Out-Null
           }
 
-          Set-AncmEnvVar -Name "ConnectionStrings__DefaultConnection" -Value $env:DEPLOY_CONNECTION_STRING
-          Set-AncmEnvVar -Name "Jwt__Secret" -Value $env:DEPLOY_JWT_SECRET
-          if (-not [string]::IsNullOrWhiteSpace($env:DEPLOY_AI_API_KEY)) {
-              Set-AncmEnvVar -Name "AI__ApiKey" -Value $env:DEPLOY_AI_API_KEY
-          }
           Set-AncmEnvVar -Name "ASPNETCORE_ENVIRONMENT" -Value "Production"
-
           $webConfig.Save($webConfigPath)
 
-          Write-Host "Environment variables configured in web.config (values not shown)."
+          Write-Host "web.config: ASPNETCORE_ENVIRONMENT=Production set."
+          Write-Host ""
+          Write-Host "ConnectionStrings__DefaultConnection / Jwt__Secret / AI__ApiKey are"
+          Write-Host "intentionally NOT written here - they must be configured once on this"
+          Write-Host "server as '${{ env.IIS_APP_POOL }}' Application Pool environment"
+          Write-Host "variables (see this step's header comment, or docs/DEPLOYMENT.md §4)."
+
+          # Informational only - never fails the deployment. TestVault.Web's
+          # own startup check (Program.cs) already refuses to boot without a
+          # valid Jwt:Secret, and this workflow's Health Check + Rollback
+          # steps already catch and undo a deployment that comes up
+          # unhealthy for any reason, including a missing connection string.
+          # This just surfaces the likely cause earlier, in this step's log,
+          # instead of making someone dig through a failed health check.
+          Import-Module WebAdministration
+          $poolEnvVars = @(
+              Get-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+                  -Filter "system.applicationHost/applicationPools/add[@name='${{ env.IIS_APP_POOL }}']/environmentVariables" `
+                  -Name "." -ErrorAction SilentlyContinue |
+                  ForEach-Object { $_.name }
+          )
+
+          Write-Host ""
+          Write-Host "Application Pool '${{ env.IIS_APP_POOL }}' environment variables:"
+          foreach ($required in @('ConnectionStrings__DefaultConnection', 'Jwt__Secret')) {
+              if ($poolEnvVars -contains $required) {
+                  Write-Host "  [OK]      $required is configured on the Application Pool."
+              } else {
+                  Write-Warning "  [MISSING] $required is not set on Application Pool '${{ env.IIS_APP_POOL }}'. TestVault.Web will fail to start until it is - see this step's header comment for the one-time setup command."
+              }
+          }
+          if ($poolEnvVars -contains 'AI__ApiKey') {
+              Write-Host "  [OK]      AI__ApiKey is configured on the Application Pool."
+          } else {
+              Write-Host "  [SKIPPED] AI__ApiKey is not set - optional, only required for AI failure analysis."
+          }
 
       # ======================================
       # Backup Current Deployment
