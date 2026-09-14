@@ -1,8 +1,11 @@
 // src/pages/FailedTests.js
 import React, { useEffect, useState } from 'react';
-import { getFailedTests, analyzeTest } from '../services';
+import { useHasRole } from '../context/AuthContext';
+import { apiOrigin } from '../services/apiClient';
+import { getFailedTests, analyzeTest } from '../services/api';
 
 export default function FailedTests() {
+  const canAnalyze = useHasRole('Admin', 'Tester');
   const [tests, setTests] = useState([]);
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState({});
@@ -63,21 +66,13 @@ export default function FailedTests() {
               <span>Retry: {test.retry_count}</span>
 
               {test.screenshot && (
-                <a
-                  href={`http://localhost:4000/${test.screenshot}`}
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <a href={`${apiOrigin}/${test.screenshot}`} target="_blank" rel="noreferrer">
                   📸 Screenshot
                 </a>
               )}
 
               {test.trace && (
-                <a
-                  href={`http://localhost:4000/${test.trace}`}
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <a href={`${apiOrigin}/${test.trace}`} target="_blank" rel="noreferrer">
                   🔍 Trace
                 </a>
               )}
@@ -99,13 +94,15 @@ export default function FailedTests() {
                 </div>
               </div>
             ) : (
-              <button
-                className="btn btn-ai"
-                onClick={() => handleAnalyze(test)}
-                disabled={analyzing[test.id]}
-              >
-                {analyzing[test.id] ? 'Analyzing...' : 'Run AI Analysis'}
-              </button>
+              canAnalyze && (
+                <button
+                  className="btn btn-ai"
+                  onClick={() => handleAnalyze(test)}
+                  disabled={analyzing[test.id]}
+                >
+                  {analyzing[test.id] ? 'Analyzing...' : 'Run AI Analysis'}
+                </button>
+              )
             )}
           </div>
         ))

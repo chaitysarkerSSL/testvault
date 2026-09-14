@@ -1,0 +1,658 @@
+# ==========================================================================
+# TestVault - Build & Deploy (ASP.NET Core / IIS AppPool)
+# ==========================================================================
+#
+# Phase 8 of the Node.js -> ASP.NET Core migration. Supersedes the earlier
+# draft at .github/workflows/testVault-dotnet-deploy.yml (written back when
+# TestVault.sln didn't exist yet - it's been folded into this file and
+# removed, along with two real fixes made while finishing it off:
+#
+#   1. Its health check hit GET / - TestVault.Web has nothing mapped there
+#      (MapControllers/MapHub only), so IIS would have returned 404 and
+#      every single deployment through that workflow would have rolled
+#      back, always, regardless of whether the app was actually healthy.
+#      Program.cs now maps a real GET /health (AddHealthChecks(),
+#      unauthenticated by design) and this workflow checks that instead.
+#   2. It never configured the app's own secrets (connection string, JWT
+#      signing key, AI API key) - see "Configure Environment Variables"
+#      below.
+#
+# DEPLOYS ONLY TestVault.Web (the ASP.NET Core API). The React frontend
+# (frontend/) is a separate static site with its own deployment story - out
+# of scope here; see the old Node-era workflow's frontend-build steps for
+# that pattern if/when it needs porting to the new architecture.
+#
+# WHY THIS STAYS workflow_dispatch-ONLY FOR NOW: the live production
+# deployment on `push: main` is still the Node.js workflow at
+# ".github/workflows/testVault Deploy.yml". Flipping that switch (retire
+# the Node workflow, add `push: main` here) is a deliberate go-live
+# decision for a human to make after running this manually at least once
+# against the real server - see the production checklist in
+# docs/DEPLOYMENT.md. This file being ready to run is not the same thing as
+# it being safe to run unattended on every push yet.
+#
+# PREREQUISITES this workflow assumes are already provisioned on the target
+# server (see docs/DEPLOYMENT.md's IIS setup guide for how):
+#   - IIS with the ASP.NET Core Module v2 (installed by the .NET 8.0
+#     Hosting Bundle - NOT the same as the SDK the runner builds with).
+#   - An Application Pool named TestVault_UAT: .NET CLR Version =
+#     "No Managed Code", Managed Pipeline Mode = "Integrated" (this
+#     workflow verifies both and fails clearly if either is wrong, rather
+#     than deploying into a pool that will never host the app correctly).
+#   - An IIS website named TestVault, bound to
+#     E:\AllWebApplication\TestVault\Current.
+#   - SQL Server reachable from this server, with Database/schema.sql and
+#     Database/identity-schema.sql already applied.
+#   - Three GitHub Actions secrets configured on this repository (Settings
+#     -> Secrets and variables -> Actions): TESTVAULT_CONNECTION_STRING,
+#     TESTVAULT_JWT_SECRET, TESTVAULT_AI_API_KEY. Never committed anywhere -
+#     see "Configure Environment Variables" below for where they end up.
+#
+# ==========================================================================
+
+name: Deploy TestVault (ASP.NET Core) to IIS
+
+on:
+  # Manual only - see the header note on why `push` isn't wired up yet.
+  workflow_dispatch:
+    inputs:
+      health_url:
+        description: "Override the base URL used for health checks (optional, e.g. https://testvault-uat.example.com)"
+        required: false
+        default: ""
+
+# Prevent two deployments from running at the same time.
+concurrency:
+  group: testvault-iis-deployment
+  cancel-in-progress: false
+
+jobs:
+
+  deploy:
+
+    runs-on: self-hosted
+
+    env:
+
+      APP_NAME: TestVault
+
+      # ---- Deployment folder structure ----------------------------------
+      BASE_PATH: E:\AllWebApplication\TestVault
+      RELEASE_PATH: E:\AllWebApplication\TestVault\Releases
+      CURRENT_PATH: E:\AllWebApplication\TestVault\Current
+      BACKUP_PATH: E:\AllWebApplication\TestVault\Backup
+
+      # ---- IIS ------------------------------------------------------------
+      IIS_SITE_NAME: TestVault
+      IIS_APP_POOL: TestVault
+
+      BUILD_CONFIGURATION: Release
+
+      # ---- Retention policy ------------------------------------------------
+      RELEASES_TO_KEEP: 5
+      BACKUPS_TO_KEEP: 5
+
+      # ---- Health check ------------------------------------------------------
+      STARTUP_WAIT_SECONDS: 15
+      HEALTH_BASE_URL: http://localhost
+
+    steps:
+
+      # ======================================
+      # Checkout
+      # ======================================
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ======================================
+      # Analyze Project Structure
+      # Locate the solution and the actual IIS-hosted web project from the
+      # real repository contents - never hardcoded.
+      # ======================================
+
+      - name: Analyze Project Structure
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "Analyzing Repository Structure"
+          Write-Host "======================================"
+
+          $workspace = "${{ github.workspace }}"
+
+          $solutions = Get-ChildItem $workspace -Filter *.sln -Recurse -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.FullName -notmatch '\\(bin|obj|node_modules)\\' }
+
+          if ($solutions.Count -eq 0) {
+              throw "No .sln file found."
+          }
+          if ($solutions.Count -gt 1) {
+              throw "Multiple .sln files found ($($solutions.Name -join ', ')). Refusing to guess which one to build."
+          }
+
+          $solution = $solutions[0].FullName
+          Write-Host "Solution found: $solution"
+
+          # Identified by SDK type (Microsoft.NET.Sdk.Web), not by name, so
+          # this keeps working regardless of what the project is called.
+          $csprojFiles = Get-ChildItem $workspace -Filter *.csproj -Recurse -File -ErrorAction SilentlyContinue |
+                          Where-Object { $_.FullName -notmatch '\\(bin|obj|node_modules)\\' }
+
+          $webProjects = $csprojFiles | Where-Object {
+              (Get-Content $_.FullName -Raw) -match 'Sdk\s*=\s*"Microsoft\.NET\.Sdk\.Web"'
+          }
+
+          if ($webProjects.Count -eq 0) {
+              throw "No project using the Microsoft.NET.Sdk.Web SDK was found. The IIS-hosted web project could not be identified."
+          }
+          if ($webProjects.Count -gt 1) {
+              throw "Multiple Microsoft.NET.Sdk.Web projects found ($($webProjects.Name -join ', ')). Refusing to guess which one is the IIS-hosted app."
+          }
+
+          $webProject = $webProjects[0].FullName
+          Write-Host "IIS-hosted web project found: $webProject"
+
+          "SOLUTION=$solution"      >> $env:GITHUB_ENV
+          "WEB_PROJECT=$webProject" >> $env:GITHUB_ENV
+
+      # ======================================
+      # Environment Validation
+      #   - dotnet SDK present
+      #   - IIS WebAdministration module available
+      #   - Application Pool exists, and is actually configured the way an
+      #     ASP.NET Core Module (ANCM) in-process app requires
+      #   - IIS site exists
+      # ======================================
+
+      - name: Environment Validation
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "Environment Validation"
+          Write-Host "======================================"
+
+          $dotnet = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+          if ($null -eq $dotnet) {
+              throw ".NET SDK not found on this runner"
+          }
+          Write-Host "dotnet path   : $($dotnet.Source)"
+          Write-Host "dotnet version: $(dotnet --version)"
+
+          try {
+              Import-Module WebAdministration -ErrorAction Stop
+          } catch {
+              throw "WebAdministration PowerShell module is not available. Install the 'IIS Management Scripts and Tools' Windows feature on this server."
+          }
+
+          $pool = Get-Item "IIS:\AppPools\${{ env.IIS_APP_POOL }}" -ErrorAction SilentlyContinue
+          if ($null -eq $pool) {
+              throw "Application Pool '${{ env.IIS_APP_POOL }}' does not exist. Create it in IIS before running this workflow - see docs/DEPLOYMENT.md."
+          }
+          Write-Host "Application Pool found: ${{ env.IIS_APP_POOL }} (state: $($pool.state))"
+
+          # "No Managed Code" is represented by an EMPTY managedRuntimeVersion,
+          # not a specific value - ANCM (which actually hosts the app in an
+          # IIS worker process) requires this; a pool still configured for
+          # classic ASP.NET (v4.0) will never host TestVault.Web correctly.
+          if ($pool.managedRuntimeVersion -ne "") {
+              throw "Application Pool '${{ env.IIS_APP_POOL }}' has .NET CLR Version = '$($pool.managedRuntimeVersion)', expected 'No Managed Code' (empty). Fix in IIS Manager: Application Pools -> ${{ env.IIS_APP_POOL }} -> Basic Settings -> .NET CLR version -> No Managed Code."
+          }
+          if ($pool.managedPipelineMode -ne "Integrated") {
+              throw "Application Pool '${{ env.IIS_APP_POOL }}' has Managed Pipeline Mode = '$($pool.managedPipelineMode)', expected 'Integrated'."
+          }
+          Write-Host "Application Pool configuration OK (No Managed Code / Integrated)"
+
+          $site = Get-Website -Name "${{ env.IIS_SITE_NAME }}" -ErrorAction SilentlyContinue
+          if ($null -eq $site) {
+              throw "IIS site '${{ env.IIS_SITE_NAME }}' does not exist. Create it (bound to ${{ env.CURRENT_PATH }}) before running this workflow."
+          }
+          Write-Host "IIS site found: ${{ env.IIS_SITE_NAME }}"
+
+          Write-Host "Environment OK"
+
+      # ======================================
+      # Restore Dependencies
+      # ======================================
+
+      - name: Restore Dependencies
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "Restoring NuGet Packages"
+          Write-Host "======================================"
+
+          dotnet restore "${{ env.SOLUTION }}"
+          if ($LASTEXITCODE -ne 0) { throw "NuGet restore failed" }
+
+          Write-Host "Restore Completed Successfully"
+
+      # ======================================
+      # Build Application
+      # ======================================
+
+      - name: Build Application
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "Building Application ($env:BUILD_CONFIGURATION)"
+          Write-Host "======================================"
+
+          dotnet build "${{ env.SOLUTION }}" `
+            --configuration "${{ env.BUILD_CONFIGURATION }}" `
+            --no-restore
+
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+
+          Write-Host "Build Completed Successfully"
+
+      # ======================================
+      # Prepare Deployment Directories
+      # ======================================
+
+      - name: Prepare Deployment Directories
+        shell: powershell
+        run: |
+          Write-Host "Preparing deployment directories"
+
+          foreach ($path in @(
+              "${{ env.BASE_PATH }}",
+              "${{ env.RELEASE_PATH }}",
+              "${{ env.CURRENT_PATH }}",
+              "${{ env.BACKUP_PATH }}"
+          )) {
+              New-Item -ItemType Directory -Path $path -Force | Out-Null
+          }
+
+          Write-Host "Deployment directories ready"
+
+      # ======================================
+      # Create Release Folder
+      # ======================================
+
+      - name: Create New Release
+        shell: powershell
+        run: |
+          $releaseName = "Release_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+          $releasePath = Join-Path "${{ env.RELEASE_PATH }}" $releaseName
+
+          New-Item -ItemType Directory -Path $releasePath -Force | Out-Null
+
+          "NEW_RELEASE=$releasePath" >> $env:GITHUB_ENV
+
+          Write-Host "Release Created:"
+          Write-Host $releasePath
+
+      # ======================================
+      # Publish Application
+      # ======================================
+
+      - name: Publish Application
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "Publishing Application"
+          Write-Host "======================================"
+
+          dotnet publish "${{ env.WEB_PROJECT }}" `
+            --configuration "${{ env.BUILD_CONFIGURATION }}" `
+            --output "${{ env.NEW_RELEASE }}" `
+            --no-build
+
+          if ($LASTEXITCODE -ne 0) { throw "Publish failed" }
+
+          $publishedFiles = Get-ChildItem "${{ env.NEW_RELEASE }}" -Force -ErrorAction SilentlyContinue
+          if ($null -eq $publishedFiles -or $publishedFiles.Count -eq 0) {
+              throw "Published release folder is empty"
+          }
+
+          # dotnet publish generates web.config automatically for
+          # Microsoft.NET.Sdk.Web projects - this is what wires up ANCM
+          # inside IIS, and what the next step edits to inject secrets.
+          if (!(Test-Path "${{ env.NEW_RELEASE }}\web.config")) {
+              throw "web.config was not found in published output. Confirm the web project targets Microsoft.NET.Sdk.Web."
+          }
+
+          Write-Host "Publish Completed Successfully"
+          Write-Host "Release Package:"
+          Write-Host "${{ env.NEW_RELEASE }}"
+
+      # ======================================
+      # Configure Environment Variables
+      #
+      # Production secrets never live in this repository (appsettings.json
+      # ships only empty placeholders - see TestVault.Web/appsettings*.json's
+      # own "// NOTE" entries). They're injected here, straight from GitHub
+      # Actions secrets into the just-published release's web.config
+      # <aspNetCore><environmentVariables> section - ANCM passes these
+      # through to the .NET process as real environment variables, which is
+      # exactly how TestVault.Web already expects to receive them
+      # (ConnectionStrings__DefaultConnection / Jwt__Secret / AI__ApiKey -
+      # double underscore is ASP.NET Core configuration's own convention for
+      # a nested key, e.g. Jwt:Secret).
+      #
+      # The values themselves only ever exist: (a) in GitHub's encrypted
+      # secret store, (b) transiently in this step's process memory, and
+      # (c) in the deployed web.config on the server's disk (never in git -
+      # Releases/ is server-local, outside the repository). GitHub
+      # Actions masks all three in this job's logs because they're
+      # referenced via `secrets.` below.
+      # ======================================
+
+      - name: Configure Environment Variables
+        shell: powershell
+        env:
+          DEPLOY_CONNECTION_STRING: ${{ secrets.TESTVAULT_CONNECTION_STRING }}
+          DEPLOY_JWT_SECRET: ${{ secrets.TESTVAULT_JWT_SECRET }}
+          DEPLOY_AI_API_KEY: ${{ secrets.TESTVAULT_AI_API_KEY }}
+        run: |
+          Write-Host "======================================"
+          Write-Host "Configuring Environment Variables"
+          Write-Host "======================================"
+
+          foreach ($name in @('DEPLOY_CONNECTION_STRING', 'DEPLOY_JWT_SECRET')) {
+              if ([string]::IsNullOrWhiteSpace((Get-Item "Env:$name" -ErrorAction SilentlyContinue).Value)) {
+                  throw "Required secret is not configured: $name. Set it under this repository's Settings -> Secrets and variables -> Actions before deploying. (AI__ApiKey is optional - only required if AI failure analysis is used.)"
+              }
+          }
+
+          $webConfigPath = Join-Path "${{ env.NEW_RELEASE }}" "web.config"
+          [xml]$webConfig = Get-Content $webConfigPath
+
+          # A recursive XPath lookup (not a fixed configuration/system.webServer/...
+          # property chain) - dotnet publish wraps system.webServer in a
+          # <location path="."> element, which a fixed chain silently misses
+          # (verified against a real `dotnet publish` output while writing
+          # this - $webConfig.configuration.'system.webServer' resolves to
+          # nothing on the actual generated file). //aspNetCore finds it
+          # regardless of the exact wrapping IIS/the SDK happens to use.
+          $aspNetCoreNode = $webConfig.SelectSingleNode("//aspNetCore")
+          if ($null -eq $aspNetCoreNode) {
+              throw "web.config has no aspNetCore node anywhere - was this really published from a Microsoft.NET.Sdk.Web project?"
+          }
+
+          $envVarsNode = $aspNetCoreNode.SelectSingleNode("environmentVariables")
+          if ($null -eq $envVarsNode) {
+              $envVarsNode = $webConfig.CreateElement("environmentVariables")
+              $aspNetCoreNode.AppendChild($envVarsNode) | Out-Null
+          }
+
+          function Set-AncmEnvVar {
+              param([string]$Name, [string]$Value)
+
+              $existing = $envVarsNode.SelectSingleNode("add[@name='$Name']")
+              if ($null -eq $existing) {
+                  $existing = $webConfig.CreateElement("add")
+                  $existing.SetAttribute("name", $Name) | Out-Null
+                  $envVarsNode.AppendChild($existing) | Out-Null
+              }
+              $existing.SetAttribute("value", $Value) | Out-Null
+          }
+
+          Set-AncmEnvVar -Name "ConnectionStrings__DefaultConnection" -Value $env:DEPLOY_CONNECTION_STRING
+          Set-AncmEnvVar -Name "Jwt__Secret" -Value $env:DEPLOY_JWT_SECRET
+          if (-not [string]::IsNullOrWhiteSpace($env:DEPLOY_AI_API_KEY)) {
+              Set-AncmEnvVar -Name "AI__ApiKey" -Value $env:DEPLOY_AI_API_KEY
+          }
+          Set-AncmEnvVar -Name "ASPNETCORE_ENVIRONMENT" -Value "Production"
+
+          $webConfig.Save($webConfigPath)
+
+          Write-Host "Environment variables configured in web.config (values not shown)."
+
+      # ======================================
+      # Backup Current Deployment
+      # ======================================
+
+      - name: Backup Current Version
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "Backing Up Current Version"
+          Write-Host "======================================"
+
+          $current = "${{ env.CURRENT_PATH }}"
+          $items = Get-ChildItem $current -Force -ErrorAction SilentlyContinue
+
+          if ($null -ne $items -and $items.Count -gt 0) {
+
+              $backupName = "Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+              $backupPath = Join-Path "${{ env.BACKUP_PATH }}" $backupName
+
+              New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+              Copy-Item "$current\*" $backupPath -Recurse -Force
+
+              "OLD_BACKUP=$backupPath" >> $env:GITHUB_ENV
+
+              Write-Host "Backup Created:"
+              Write-Host $backupPath
+
+          } else {
+
+              Write-Host "Current folder is empty. Backup skipped."
+              "OLD_BACKUP=" >> $env:GITHUB_ENV
+
+          }
+
+      # ======================================
+      # Switch Current: stop AppPool, copy release in, restart AppPool
+      # (a real IIS Application Pool stop/start - legitimate here because
+      # TestVault.Web is genuinely IIS-hosted via ANCM)
+      # ======================================
+
+      - name: Deploy Release
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "Deploying Release"
+          Write-Host "======================================"
+
+          Import-Module WebAdministration
+
+          $current = "${{ env.CURRENT_PATH }}"
+          $release = "${{ env.NEW_RELEASE }}"
+          $appPool = "${{ env.IIS_APP_POOL }}"
+
+          Write-Host "Current Path: $current"
+          Write-Host "Release Path: $release"
+
+          Write-Host "Stopping Application Pool: $appPool"
+          Stop-WebAppPool -Name $appPool
+
+          $timeout = (Get-Date).AddSeconds(30)
+          while ((Get-WebAppPoolState -Name $appPool).Value -ne 'Stopped' -and (Get-Date) -lt $timeout) {
+              Start-Sleep -Seconds 1
+          }
+          if ((Get-WebAppPoolState -Name $appPool).Value -ne 'Stopped') {
+              throw "Application Pool '$appPool' did not stop within 30 seconds"
+          }
+
+          Write-Host "Removing previous application files"
+          Get-ChildItem $current -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force
+
+          Write-Host "Copying new release to Current"
+          Copy-Item "$release\*" $current -Recurse -Force
+
+          if (!(Test-Path "$current\web.config")) {
+              throw "Deployment verification failed: web.config not found"
+          }
+
+          Write-Host "Starting Application Pool: $appPool"
+          Start-WebAppPool -Name $appPool
+
+          $timeout = (Get-Date).AddSeconds(30)
+          while ((Get-WebAppPoolState -Name $appPool).Value -ne 'Started' -and (Get-Date) -lt $timeout) {
+              Start-Sleep -Seconds 1
+          }
+          if ((Get-WebAppPoolState -Name $appPool).Value -ne 'Started') {
+              throw "Application Pool '$appPool' did not start within 30 seconds"
+          }
+
+          Write-Host "Deployment Completed Successfully"
+
+      # ======================================
+      # Health Check
+      #   - Application returns HTTP 200 (GET /health)
+      #   - An API endpoint is reachable (GET /api/runs)
+      #   - The SignalR negotiate endpoint is reachable (POST /hubs/run/negotiate)
+      #
+      # Both the API and hub endpoints require authentication by default
+      # (Program.cs's global fallback authorization policy) and this check
+      # has no test user's credentials to present - a 401 on those two
+      # means "reachable and correctly enforcing authentication", which
+      # IS the healthy outcome for an unauthenticated probe. Only a
+      # connection failure, a 5xx, or an unexpected status fails the check.
+      # ======================================
+
+      - name: Application Health Check
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "Application Health Check"
+          Write-Host "======================================"
+
+          Write-Host "Waiting ${{ env.STARTUP_WAIT_SECONDS }}s for application startup..."
+          Start-Sleep -Seconds ([int]"${{ env.STARTUP_WAIT_SECONDS }}")
+
+          $baseUrl = "${{ github.event.inputs.health_url }}"
+          if ([string]::IsNullOrWhiteSpace($baseUrl)) { $baseUrl = "${{ env.HEALTH_BASE_URL }}" }
+          $baseUrl = $baseUrl.TrimEnd('/')
+
+          Import-Module WebAdministration
+          $poolState = (Get-WebAppPoolState -Name "${{ env.IIS_APP_POOL }}").Value
+          Write-Host "Application Pool state: $poolState"
+          if ($poolState -ne 'Started') {
+              throw "Application Health Check Failed: App Pool '${{ env.IIS_APP_POOL }}' is not running"
+          }
+
+          function Test-Endpoint {
+              param(
+                  [string]$Name,
+                  [string]$Url,
+                  [string]$Method = 'GET',
+                  [bool]$AllowUnauthorized = $false
+              )
+
+              Write-Host "Checking $Name : $Method $Url"
+              try {
+                  $response = Invoke-WebRequest -Uri $Url -Method $Method -UseBasicParsing -TimeoutSec 30
+                  Write-Host "  -> HTTP $($response.StatusCode)"
+                  return $true
+              } catch {
+                  $statusCode = $null
+                  if ($_.Exception.Response) {
+                      $statusCode = [int]$_.Exception.Response.StatusCode
+                  }
+
+                  if ($AllowUnauthorized -and $statusCode -eq 401) {
+                      Write-Host "  -> HTTP 401 (authentication required) - endpoint is reachable and enforcing auth correctly."
+                      return $true
+                  }
+
+                  Write-Host "  -> FAILED: $($_.Exception.Message)"
+                  return $false
+              }
+          }
+
+          $healthOk    = Test-Endpoint -Name "Application health"    -Url "$baseUrl/health"
+          $apiOk       = Test-Endpoint -Name "API endpoint"          -Url "$baseUrl/api/runs" -AllowUnauthorized $true
+          $signalROk   = Test-Endpoint -Name "SignalR negotiate"     -Url "$baseUrl/hubs/run/negotiate" -Method 'POST' -AllowUnauthorized $true
+
+          if (-not ($healthOk -and $apiOk -and $signalROk)) {
+              throw "Application Health Check Failed (health: $healthOk, api: $apiOk, signalr: $signalROk)"
+          }
+
+          Write-Host "======================================"
+          Write-Host "Application Healthy"
+          Write-Host "======================================"
+
+      # ======================================
+      # Rollback
+      # Runs only if a previous step (typically the health check) failed.
+      # ======================================
+
+      - name: Rollback On Failure
+        if: failure()
+        shell: powershell
+        run: |
+          Write-Host "======================================"
+          Write-Host "DEPLOYMENT FAILED - ROLLING BACK"
+          Write-Host "======================================"
+
+          Import-Module WebAdministration
+
+          $current = "${{ env.CURRENT_PATH }}"
+          $oldBackup = "${{ env.OLD_BACKUP }}"
+          $appPool = "${{ env.IIS_APP_POOL }}"
+
+          if ([string]::IsNullOrWhiteSpace($oldBackup) -or -not (Test-Path $oldBackup)) {
+              Write-Warning "No previous backup available to roll back to. Manual intervention required."
+              exit 1
+          }
+
+          Write-Host "Stopping Application Pool: $appPool"
+          Stop-WebAppPool -Name $appPool -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+
+          Write-Host "Restoring previous version from: $oldBackup"
+          Get-ChildItem $current -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force
+
+          Copy-Item "$oldBackup\*" $current -Recurse -Force
+
+          Write-Host "Starting Application Pool: $appPool"
+          Start-WebAppPool -Name $appPool
+
+          Write-Host "Rollback complete. Previous stable version restored."
+          Write-Host "Failing this job so the failed deployment is visible."
+          exit 1
+
+      # ======================================
+      # Cleanup Old Releases (only after a successful deployment)
+      # ======================================
+
+      - name: Cleanup Old Releases
+        if: success()
+        shell: powershell
+        run: |
+          Write-Host "Cleaning old releases"
+
+          $keep = [int]"${{ env.RELEASES_TO_KEEP }}"
+
+          if (Test-Path "${{ env.RELEASE_PATH }}") {
+              $releases = Get-ChildItem "${{ env.RELEASE_PATH }}" -Directory |
+                            Sort-Object CreationTime -Descending
+
+              if ($releases.Count -gt $keep) {
+                  $releases | Select-Object -Skip $keep | Remove-Item -Recurse -Force
+                  Write-Host "Old releases removed."
+              } else {
+                  Write-Host "No old releases to remove."
+              }
+          }
+
+      # ======================================
+      # Cleanup Old Backups (only after a successful deployment)
+      # ======================================
+
+      - name: Cleanup Old Backups
+        if: success()
+        shell: powershell
+        run: |
+          Write-Host "Cleaning old backups"
+
+          $keep = [int]"${{ env.BACKUPS_TO_KEEP }}"
+
+          if (Test-Path "${{ env.BACKUP_PATH }}") {
+              $backups = Get-ChildItem "${{ env.BACKUP_PATH }}" -Directory |
+                           Sort-Object CreationTime -Descending
+
+              if ($backups.Count -gt $keep) {
+                  $backups | Select-Object -Skip $keep | Remove-Item -Recurse -Force
+                  Write-Host "Old backups removed."
+              } else {
+                  Write-Host "No old backups to remove."
+              }
+          }

@@ -1,7 +1,8 @@
 // src/pages/RunDetail.js
 import React, { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { getRunDetail } from '../services';
+import { apiOrigin } from '../services/apiClient';
+import { getRunDetail } from '../services/api';
 
 export default function RunDetail() {
   const { id } = useParams();
@@ -104,18 +105,14 @@ export default function RunDetail() {
 
                 <td>
                   {t.screenshot && (
-                    <a
-                      href={`http://localhost:4000/${t.screenshot}`}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
+                    <a href={`${apiOrigin}/${t.screenshot}`} target="_blank" rel="noreferrer">
                       📸 Screenshot
                     </a>
                   )}
 
                   {t.trace && (
                     <a
-                      href={`http://localhost:4000/${t.trace}`}
+                      href={`${apiOrigin}/${t.trace}`}
                       target="_blank"
                       rel="noreferrer"
                       style={{ marginLeft: 8 }}

@@ -1,0 +1,32 @@
+# ==========================================================================
+# .NET (TestVault.Web / .Application / .Infrastructure / .Domain)
+# ==========================================================================
+# No .gitignore existed in this repository before the ASP.NET Core
+# migration began - these rules cover the .NET build output only. The
+# pre-existing Node.js side (node_modules/, frontend/build/, backend/.env)
+# is intentionally left untouched here; ask if you'd like those covered
+# too.
+
+[Bb]in/
+[Oo]bj/
+.vs/
+*.user
+*.suo
+
+# dotnet publish output (never commit a build artifact)
+publish/
+*.pubxml
+
+# Playwright failure artifacts (screenshots/videos/traces), written by the
+# still-unchanged Node/Playwright reporter and now also served directly by
+# TestVault.Web (Program.cs's UseStaticFiles calls, added in Phase 7 -
+# replacing backend/server.js's app.use('/screenshots', express.static(...))
+# etc.). The folders themselves are tracked (via .gitkeep) since
+# PhysicalFileProvider throws at startup if its root directory doesn't
+# exist - only their generated contents are ignored.
+/screenshots/*
+!/screenshots/.gitkeep
+/videos/*
+!/videos/.gitkeep
+/traces/*
+!/traces/.gitkeep

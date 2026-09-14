@@ -20,6 +20,9 @@ body {
   color: #fff;
   padding: 24px 16px;
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
 }
 
 .logo {
@@ -273,4 +276,88 @@ code {
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 12px;
+}
+
+/* ── Login ──────────────────────────────────────── */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f4f6f9;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 360px;
+}
+
+.login-logo {
+  justify-content: center;
+  color: #1a1a2e;
+  margin-bottom: 28px;
+}
+
+.field-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: #555;
+  margin-bottom: 6px;
+}
+
+.text-input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #e8eaf0;
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+
+.text-input:focus {
+  outline: none;
+  border-color: #4f46e5;
+}
+
+.login-submit {
+  width: 100%;
+}
+
+/* ── Sidebar user/logout footer ─────────────────── */
+.sidebar-footer {
+  margin-top: auto;
+  padding-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.sidebar-user {
+  font-size: 13px;
+  color: #aab0c0;
+  margin-bottom: 8px;
+  word-break: break-word;
+}
+
+.sidebar-user .role-badge {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.1);
+  font-size: 11px;
+}
+
+.sidebar-logout {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: none;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.sidebar-logout:hover {
+  background: rgba(255, 255, 255, 0.18);
 }

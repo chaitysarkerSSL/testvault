@@ -4,7 +4,7 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid, Legend,
 } from 'recharts';
-import { getRuns, getSummary } from '../services';
+import { getRuns, getSummary } from '../services/api';
 
 export default function Dashboard() {
   const [summary, setSummary] = useState(null);

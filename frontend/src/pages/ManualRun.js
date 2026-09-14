@@ -1,53 +1,79 @@
 // src/pages/ManualRun.js
-import React, { useState, useEffect, useRef } from 'react';
-import { socket, startRun, stopRun } from '../services';
+import React, { useEffect, useRef, useState } from 'react';
+import { useHasRole } from '../context/AuthContext';
+import { runStatus, startRun, stopRun } from '../services/api';
+import { RUN_EVENTS, on, off, start as startSignalR } from '../services/signalRService';
 
 export default function ManualRun() {
+  const canOperate = useHasRole('Admin', 'Tester');
+
   const [isRunning, setIsRunning] = useState(false);
   const [logs, setLogs] = useState([]);
   const [status, setStatus] = useState(null);
   const logRef = useRef(null);
 
   useEffect(() => {
-    socket.on('run:started', () => {
+    // Seed the initial state in case a run is already in progress (e.g. the
+    // page was reloaded mid-run) - the original Socket.IO version had no
+    // equivalent call and would just show "not running" until the next
+    // event happened to arrive.
+    runStatus()
+      .then((s) => setIsRunning(Boolean(s.is_running)))
+      .catch(() => {});
+
+    // Event payloads use SignalR's own default JSON casing (camelCase -
+    // runId/isError/exitCode/...), which is NOT the snake_case the REST API
+    // uses (see apiClient.js's note) - SignalR's JsonHubProtocol is a
+    // separate serializer from the MVC one TestVault.Web configures for
+    // controllers.
+    const handleStarted = () => {
       setIsRunning(true);
       setStatus({ type: 'running', text: '⏳ Test is running...' });
       setLogs([]);
-    });
+    };
 
-    socket.on('run:log', ({ log, isError }) => {
-      setLogs(prev => [
-        ...prev,
-        { text: log.trim(), isError, id: Date.now() + Math.random() }
-      ]);
-    });
+    const handleLog = ({ log, isError }) => {
+      setLogs((prev) => [...prev, { text: log.trim(), isError, id: Date.now() + Math.random() }]);
+    };
 
-    socket.on('run:finished', ({ success }) => {
+    const handleFinished = ({ success }) => {
       setIsRunning(false);
       setStatus({
         type: success ? 'success' : 'error',
-        text: success
-          ? '✅ All tests completed successfully!'
-          : '❌ Some tests have failed.',
+        text: success ? '✅ All tests completed successfully!' : '❌ Some tests have failed.',
       });
-    });
+    };
 
-    socket.on('run:stopped', () => {
+    const handleStopped = () => {
       setIsRunning(false);
       setStatus({ type: 'warning', text: '⛔ Run stopped.' });
-    });
+    };
 
-    socket.on('run:error', ({ message }) => {
+    const handleError = ({ message }) => {
       setIsRunning(false);
       setStatus({ type: 'error', text: `❌ Error: ${message}` });
+    };
+
+    on(RUN_EVENTS.RUN_STARTED, handleStarted);
+    on(RUN_EVENTS.RUN_LOG, handleLog);
+    on(RUN_EVENTS.RUN_FINISHED, handleFinished);
+    on(RUN_EVENTS.RUN_STOPPED, handleStopped);
+    on(RUN_EVENTS.RUN_ERROR, handleError);
+
+    startSignalR().catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error('Failed to connect to the live run hub:', err);
+      setStatus({ type: 'error', text: '❌ Could not connect to live updates. Logs will not stream in real time.' });
     });
 
     return () => {
-      socket.off('run:started');
-      socket.off('run:log');
-      socket.off('run:finished');
-      socket.off('run:stopped');
-      socket.off('run:error');
+      off(RUN_EVENTS.RUN_STARTED, handleStarted);
+      off(RUN_EVENTS.RUN_LOG, handleLog);
+      off(RUN_EVENTS.RUN_FINISHED, handleFinished);
+      off(RUN_EVENTS.RUN_STOPPED, handleStopped);
+      off(RUN_EVENTS.RUN_ERROR, handleError);
+      // Deliberately not stopping the connection here - it's a shared
+      // singleton (services/signalRService.js) other pages may also use.
     };
   }, []);
 
@@ -70,7 +96,14 @@ export default function ManualRun() {
   };
 
   const handleStop = async () => {
-    await stopRun();
+    try {
+      await stopRun();
+    } catch (err) {
+      setStatus({
+        type: 'error',
+        text: `Error: ${err.response?.data?.message || err.message}`,
+      });
+    }
   };
 
   return (
@@ -78,25 +111,34 @@ export default function ManualRun() {
       <h1 className="page-title">Manual Run</h1>
 
       <div className="card">
-        <p style={{ color: '#555', marginBottom: 20 }}>
-          Click the button below to start Playwright tests. Live logs will appear in the console.
-        </p>
+        {canOperate ? (
+          <>
+            <p style={{ color: '#555', marginBottom: 20 }}>
+              Click the button below to start Playwright tests. Live logs will appear in the console.
+            </p>
 
-        <div style={{ display: 'flex', gap: 12 }}>
-          <button
-            className={`btn btn-primary ${isRunning ? 'disabled' : ''}`}
-            onClick={handleStart}
-            disabled={isRunning}
-          >
-            {isRunning ? '⏳ Running...' : '▶️ Run Now'}
-          </button>
+            <div style={{ display: 'flex', gap: 12 }}>
+              <button
+                className={`btn btn-primary ${isRunning ? 'disabled' : ''}`}
+                onClick={handleStart}
+                disabled={isRunning}
+              >
+                {isRunning ? '⏳ Running...' : '▶️ Run Now'}
+              </button>
 
-          {isRunning && (
-            <button className="btn btn-danger" onClick={handleStop}>
-              ⛔ Stop Run
-            </button>
-          )}
-        </div>
+              {isRunning && (
+                <button className="btn btn-danger" onClick={handleStop}>
+                  ⛔ Stop Run
+                </button>
+              )}
+            </div>
+          </>
+        ) : (
+          <p style={{ color: '#888' }}>
+            Your role does not permit starting or stopping test runs. You can still watch live
+            logs below while a Tester or Admin runs one.
+          </p>
+        )}
 
         {status && (
           <div className={`alert alert-${status.type}`} style={{ marginTop: 16 }}>
@@ -117,11 +159,7 @@ export default function ManualRun() {
         >
           <h2>Live Logs</h2>
 
-          <button
-            className="btn btn-sm"
-            onClick={() => setLogs([])}
-            disabled={isRunning}
-          >
+          <button className="btn btn-sm" onClick={() => setLogs([])} disabled={isRunning}>
             Clear
           </button>
         </div>
@@ -142,11 +180,9 @@ export default function ManualRun() {
           }}
         >
           {logs.length === 0 ? (
-            <span style={{ color: '#555' }}>
-              Live logs will appear here when the run starts...
-            </span>
+            <span style={{ color: '#555' }}>Live logs will appear here when the run starts...</span>
           ) : (
-            logs.map(log => (
+            logs.map((log) => (
               <div
                 key={log.id}
                 style={{

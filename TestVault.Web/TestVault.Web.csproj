@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <!-- net8.0 = current .NET LTS (supported through Nov 2026) -->
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!--
+      Explicit for IIS hosting clarity (this is already the default for
+      Microsoft.NET.Sdk.Web projects, but stated explicitly here since IIS
+      AppPool hosting is a hard requirement for this project).
+      InProcess loads the app inside the IIS worker process (w3wp.exe) via
+      the ASP.NET Core Module v2 - the standard, best-performing model for
+      IIS-hosted ASP.NET Core apps.
+    -->
+    <AspNetCoreHostingModel>InProcess</AspNetCoreHostingModel>
+
+    <!--
+      Feeds controller/action XML doc comments (<summary>, <param>,
+      <response>) into Swagger via SwaggerGen's IncludeXmlComments (see
+      Program.cs) so the generated UI shows real descriptions, not just
+      method signatures. CS1591 ("missing XML comment") is suppressed since
+      that warning is meant for public library APIs - this is an
+      application, and only endpoints are documented, not every member.
+    -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.11" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.11">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TestVault.Application\TestVault.Application.csproj" />
+    <ProjectReference Include="..\TestVault.Infrastructure\TestVault.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>
