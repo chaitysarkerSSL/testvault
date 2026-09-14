@@ -154,6 +154,51 @@ jobs:
           }
           Write-Host "IIS site found: ${{ env.IIS_SITE_NAME }}"
 
+          # The site EXISTING isn't enough - if its Physical Path doesn't
+          # actually point at CURRENT_PATH, every deployment below will
+          # keep succeeding (publish, backup, copy into Current, App Pool
+          # starts) while IIS silently keeps serving whatever it was
+          # already pointed at instead - a deployment that looks entirely
+          # healthy right up until the Health Check step 404s on every
+          # single route.
+          $expectedPhysicalPath = "${{ env.CURRENT_PATH }}".TrimEnd('\')
+          $actualPhysicalPath = "$($site.physicalPath)".Trim('"').TrimEnd('\')
+          if ($actualPhysicalPath -ne $expectedPhysicalPath) {
+              throw "IIS site '${{ env.IIS_SITE_NAME }}' has Physical Path = '$actualPhysicalPath', expected '$expectedPhysicalPath'. Fix in IIS Manager (Sites -> ${{ env.IIS_SITE_NAME }} -> Basic Settings -> Physical path) or: Set-ItemProperty 'IIS:\Sites\${{ env.IIS_SITE_NAME }}' -Name physicalPath -Value '$expectedPhysicalPath'."
+          }
+          Write-Host "Physical Path OK: $actualPhysicalPath"
+
+          # Capture this site's ACTUAL http binding rather than assuming
+          # one - the Application Health Check step builds its request URL
+          # from this, not from a hardcoded "http://localhost". IIS routes
+          # by exact Host-header match first; a binding with a specific
+          # hostname (bindingInformation's 3rd segment, e.g.
+          # "testvault-uat.yourdomain.internal" - see docs/DEPLOYMENT.md
+          # §1.4's own example) will NEVER match a bare "localhost" request.
+          # When that happens, IIS's built-in Default Web Site - which has
+          # a blank-hostname (catch-all) binding on port 80 out of the box
+          # - answers instead, and its physical path has none of this
+          # app's routes: a clean, uniform 404 on /health, /api/*, and
+          # /hubs/* alike, with the Application Pool never even entering
+          # the picture. This is the most common cause of exactly that
+          # symptom, and is why the URL isn't just hardcoded here.
+          $httpBindings = @($site.bindings.Collection | Where-Object { $_.protocol -eq 'http' })
+          if ($httpBindings.Count -eq 0) {
+              throw "IIS site '${{ env.IIS_SITE_NAME }}' has no http binding. Add one: Sites -> ${{ env.IIS_SITE_NAME }} -> Bindings."
+          }
+
+          $bindingParts = $httpBindings[0].bindingInformation -split ':'
+          $bindingPort = $bindingParts[1]
+          $bindingHostHeader = if ($bindingParts.Count -gt 2) { $bindingParts[2] } else { '' }
+
+          Write-Host "HTTP binding: port=$bindingPort, host header=$(if ($bindingHostHeader) { $bindingHostHeader } else { '(none - catch-all)' })"
+          "HEALTH_CHECK_PORT=$bindingPort" >> $env:GITHUB_ENV
+          "HEALTH_CHECK_HOST_HEADER=$bindingHostHeader" >> $env:GITHUB_ENV
+
+          if ($bindingHostHeader) {
+              Write-Warning "Site '${{ env.IIS_SITE_NAME }}' requires Host header '$bindingHostHeader' - Application Health Check will send it explicitly. A request without it (e.g. a browser hitting this server's bare IP) will be served by Default Web Site or another site instead, not this one."
+          }
+
           # appcmd.exe is what the Deploy Release / Rollback On Failure steps
           # use to stop/start the Application Pool (see their own comments
           # for why, versus Stop-WebAppPool/Start-WebAppPool) - confirmed
@@ -574,9 +619,37 @@ jobs:
           Write-Host "Waiting ${{ env.STARTUP_WAIT_SECONDS }}s for application startup..."
           Start-Sleep -Seconds ([int]"${{ env.STARTUP_WAIT_SECONDS }}")
 
-          $baseUrl = "${{ github.event.inputs.health_url }}"
-          if ([string]::IsNullOrWhiteSpace($baseUrl)) { $baseUrl = "${{ env.HEALTH_BASE_URL }}" }
-          $baseUrl = $baseUrl.TrimEnd('/')
+          $healthUrlOverride = "${{ github.event.inputs.health_url }}"
+          $headers = @{}
+
+          if (-not [string]::IsNullOrWhiteSpace($healthUrlOverride)) {
+              # An explicit override always wins - whoever passed
+              # workflow_dispatch's health_url is targeting a specific,
+              # already-known-good URL (e.g. a real public hostname) and
+              # doesn't need the binding-derived logic below.
+              $baseUrl = $healthUrlOverride.TrimEnd('/')
+          } elseif (-not [string]::IsNullOrWhiteSpace("${{ env.HEALTH_CHECK_PORT }}")) {
+              # Built from THIS site's actual IIS binding, captured in
+              # Environment Validation - not a hardcoded "http://localhost"
+              # - see that step's comment for why a hardcoded assumption
+              # here is exactly what let a 404-for-everything deployment
+              # look "healthy enough to attempt" in the first place.
+              $port = "${{ env.HEALTH_CHECK_PORT }}"
+              $bindingHostHeader = "${{ env.HEALTH_CHECK_HOST_HEADER }}"
+              $portSuffix = if ($port -ne '80') { ":$port" } else { '' }
+              $baseUrl = "http://localhost$portSuffix"
+
+              if (-not [string]::IsNullOrWhiteSpace($bindingHostHeader)) {
+                  $headers['Host'] = $bindingHostHeader
+                  Write-Host "Sending Host header '$bindingHostHeader' to match IIS site '${{ env.IIS_SITE_NAME }}' binding."
+              }
+          } else {
+              # Fallback only - Environment Validation normally always sets
+              # HEALTH_CHECK_PORT; this covers a re-run that somehow skipped it.
+              $baseUrl = "${{ env.HEALTH_BASE_URL }}".TrimEnd('/')
+          }
+
+          Write-Host "Health check target: $baseUrl (Host header: $(if ($headers['Host']) { $headers['Host'] } else { '(default)' }))"
 
           Import-Module WebAdministration
           $poolState = (Get-WebAppPoolState -Name "${{ env.IIS_APP_POOL }}").Value
@@ -590,12 +663,13 @@ jobs:
                   [string]$Name,
                   [string]$Url,
                   [string]$Method = 'GET',
-                  [bool]$AllowUnauthorized = $false
+                  [bool]$AllowUnauthorized = $false,
+                  [hashtable]$Headers = @{}
               )
 
               Write-Host "Checking $Name : $Method $Url"
               try {
-                  $response = Invoke-WebRequest -Uri $Url -Method $Method -UseBasicParsing -TimeoutSec 30
+                  $response = Invoke-WebRequest -Uri $Url -Method $Method -Headers $Headers -UseBasicParsing -TimeoutSec 30
                   Write-Host "  -> HTTP $($response.StatusCode)"
                   return $true
               } catch {
@@ -614,9 +688,9 @@ jobs:
               }
           }
 
-          $healthOk    = Test-Endpoint -Name "Application health"    -Url "$baseUrl/health"
-          $apiOk       = Test-Endpoint -Name "API endpoint"          -Url "$baseUrl/api/runs" -AllowUnauthorized $true
-          $signalROk   = Test-Endpoint -Name "SignalR negotiate"     -Url "$baseUrl/hubs/run/negotiate" -Method 'POST' -AllowUnauthorized $true
+          $healthOk    = Test-Endpoint -Name "Application health"    -Url "$baseUrl/health" -Headers $headers
+          $apiOk       = Test-Endpoint -Name "API endpoint"          -Url "$baseUrl/api/runs" -AllowUnauthorized $true -Headers $headers
+          $signalROk   = Test-Endpoint -Name "SignalR negotiate"     -Url "$baseUrl/hubs/run/negotiate" -Method 'POST' -AllowUnauthorized $true -Headers $headers
 
           if (-not ($healthOk -and $apiOk -and $signalROk)) {
               throw "Application Health Check Failed (health: $healthOk, api: $apiOk, signalr: $signalROk)"

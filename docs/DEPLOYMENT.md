@@ -84,6 +84,15 @@ before the very first deployment.)
 5. Binding: whatever hostname/port this environment actually uses (e.g.
    `testvault-uat.yourdomain.internal` on port 80/443). This guide
    intentionally doesn't prescribe one — it's environment-specific.
+   **If you bind to a specific hostname** (not blank/catch-all), IIS's
+   built-in **Default Web Site** still has its own catch-all binding on
+   port 80 — a request without the right `Host` header (e.g. a bare
+   `http://localhost/...` probe) lands on Default Web Site instead of this
+   one, and 404s on every route since Default Web Site's physical path has
+   none of them. The workflow's **Environment Validation** step reads this
+   site's actual binding and has **Application Health Check** send the
+   matching `Host` header automatically (§6) — no manual step needed here,
+   just be aware of it if you ever test with `curl`/a browser directly.
 6. Grant the application pool identity (`IIS AppPool\TestVault_UAT` by
    default) **read & execute** on `E:\AllWebApplication\TestVault\Current`
    and everything under it.
@@ -236,7 +245,8 @@ Backup Current                (snapshot Current -> Backup\Backup_<timestamp>, sk
    ↓
 Deploy Release                (appcmd stop apppool -> replace Current's contents -> appcmd start apppool)
    ↓
-Health Check                  (GET /health, GET /api/runs, POST /hubs/run/negotiate)
+Health Check                  (GET /health, GET /api/runs, POST /hubs/run/negotiate -
+                                against this site's OWN IIS binding, Host header included - §6.1)
    ↓
    ├─ success → Cleanup Old Releases, Cleanup Old Backups (keep newest 5 of each)
    └─ failure → Rollback (restore the backup just taken, restart the pool, fail the job)
@@ -414,6 +424,40 @@ it proves the endpoint exists, routing/DI/middleware all ran correctly, and
 authentication is being enforced as designed. Only a connection failure, a
 5xx, or an unexpected status fails the check.
 
+### 6.1 How the target URL/Host header is chosen
+
+**Never hardcoded.** A fixed `http://localhost/...` assumption silently
+breaks the moment the IIS site is bound to a specific hostname instead of a
+blank/catch-all binding (§1.4) — the request then lands on IIS's Default
+Web Site instead of `TestVault`, and every route 404s even though the app
+and Application Pool are both completely healthy. To avoid that:
+
+1. **Environment Validation** reads the `TestVault` site's actual
+   `physicalPath` (fails the deployment early if it doesn't match
+   `Current\` — a second, independent way this exact symptom can happen)
+   and its first `http` binding, exporting the binding's port and host
+   header (if any) as `HEALTH_CHECK_PORT` / `HEALTH_CHECK_HOST_HEADER`.
+2. **Application Health Check** builds its request against
+   `http://localhost[:port]` and, if the binding required one, sends the
+   matching `Host` header explicitly on every request.
+3. Passing `health_url` to `workflow_dispatch` still overrides all of this
+   — useful for testing against a real external hostname/HTTPS binding
+   directly, bypassing the loopback/Host-header logic entirely.
+
+**Final health check URLs actually used** (both are correct — which one
+applies depends purely on how the site is bound, checked automatically
+every run):
+
+- Blank/catch-all binding on port 80: `http://localhost/health`,
+  `http://localhost/api/runs`, `http://localhost/hubs/run/negotiate` (no
+  `Host` header override — this is what it fell back to before, and remains
+  correct for a site actually bound that way).
+- Specific-hostname binding, e.g. `testvault-uat.yourdomain.internal` on
+  port 80: same paths, same `http://localhost` request line (still the
+  loopback address — this is the same server), but with
+  `Host: testvault-uat.yourdomain.internal` sent explicitly so IIS routes
+  to `TestVault` instead of Default Web Site.
+
 ---
 
 ## 7. Production Checklist
@@ -423,7 +467,7 @@ authentication is being enforced as designed. Only a connection failure, a
 - [ ] .NET 8.0 Hosting Bundle installed (§1.1); `Get-WebGlobalModule -Name AspNetCoreModuleV2` succeeds.
 - [ ] `TestVault_UAT` application pool exists: .NET CLR Version = No Managed Code, Pipeline Mode = Integrated (§1.2).
 - [ ] Folder structure created; app pool identity has read & execute on `Current\` (§1.3–1.4).
-- [ ] `TestVault` IIS site created, bound to `Current\`, with a real binding (§1.4).
+- [ ] `TestVault` IIS site created, bound to `Current\`, with a real binding (§1.4) — Environment Validation now verifies both automatically every run, but confirm once by hand too: `(Get-Website -Name TestVault).physicalPath` and `Get-WebBinding -Name TestVault`.
 - [ ] SQL Server reachable from this server; `Database/schema.sql` and `Database/identity-schema.sql` both applied (§1.5).
 - [ ] Node.js, npm, and Playwright browsers (`npx playwright install`) installed at the path `Playwright:WorkingDirectory` will point to (§1.6).
 - [ ] Self-hosted GitHub Actions runner registered and running as a service on this server, with the .NET 8.0 **SDK** on `PATH` (§1.7).
