@@ -154,6 +154,36 @@ jobs:
           }
           Write-Host "IIS site found: ${{ env.IIS_SITE_NAME }}"
 
+          # appcmd.exe is what the Deploy Release / Rollback On Failure steps
+          # use to stop/start the Application Pool (see their own comments
+          # for why, versus Stop-WebAppPool/Start-WebAppPool) - confirmed
+          # present here so a missing/non-standard IIS install fails fast,
+          # with a clear message, instead of mid-deployment.
+          $appcmdPath = Join-Path $env:WINDIR "System32\inetsrv\appcmd.exe"
+          if (!(Test-Path $appcmdPath)) {
+              throw "appcmd.exe not found at $appcmdPath. Confirm IIS is actually installed on this runner (not just the WebAdministration PowerShell module)."
+          }
+          "APPCMD_PATH=$appcmdPath" >> $env:GITHUB_ENV
+
+          # Diagnostic only - never fails this step. Stopping/starting the
+          # Application Pool later requires the account running this
+          # workflow to be a local Administrator on this server; IIS_IUSRS
+          # membership and NTFS "Modify" on the deployment folder do NOT
+          # grant that (IIS_IUSRS is the app pool WORKER PROCESS identity
+          # group, not an IIS management group; NTFS rights on
+          # E:\AllWebApplication\TestVault only cover site content, not
+          # applicationHost.config / WAS). Surfaced here, early and clearly,
+          # instead of only ever showing up as a bare "Access is denied"
+          # from Stop-WebAppPool three steps later.
+          $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $isAdmin = ([Security.Principal.WindowsPrincipal]$currentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "Running as: $($currentIdentity.Name)"
+          if ($isAdmin) {
+              Write-Host "Local Administrator: Yes - Application Pool control (stop/start) should succeed."
+          } else {
+              Write-Warning "Local Administrator: No. '$($currentIdentity.Name)' is not in the local Administrators group on this server - Stop/Start Application Pool will very likely fail with 'Access is denied' in the Deploy Release step. Add this account to the local Administrators group and restart the runner service before retrying (see docs/DEPLOYMENT.md §1.8)."
+          }
+
           Write-Host "Environment OK"
 
       # ======================================
@@ -431,6 +461,24 @@ jobs:
       # Switch Current: stop AppPool, copy release in, restart AppPool
       # (a real IIS Application Pool stop/start - legitimate here because
       # TestVault.Web is genuinely IIS-hosted via ANCM)
+      #
+      # Stop/start go through appcmd.exe, not the WebAdministration module's
+      # Stop-WebAppPool/Start-WebAppPool cmdlets. Both ultimately ask WAS
+      # (Windows Process Activation Service) to change the pool's state, so
+      # appcmd.exe is NOT a way around needing Administrator rights - if the
+      # account running this workflow isn't a local Administrator on this
+      # server, this step will still fail (see Environment Validation's
+      # admin-rights check above, and docs/DEPLOYMENT.md §1.8). It's used here
+      # because Stop-WebAppPool/Start-WebAppPool activate an in-process COM
+      # object (Microsoft.Web.Administration.ServerManager) whose apartment-
+      # threading assumptions are geared toward an interactive PowerShell
+      # session; under a non-interactive Windows Service host (exactly how
+      # the GitHub Actions runner runs), that activation has been observed
+      # to behave inconsistently even for a genuinely privileged account.
+      # appcmd.exe is a plain console process with no COM activation step,
+      # so it doesn't have that failure mode - and Get-WebAppPoolState
+      # below is read-only (confirmed working per the reported Get-Item
+      # test), so it's kept as-is for polling.
       # ======================================
 
       - name: Deploy Release
@@ -445,12 +493,30 @@ jobs:
           $current = "${{ env.CURRENT_PATH }}"
           $release = "${{ env.NEW_RELEASE }}"
           $appPool = "${{ env.IIS_APP_POOL }}"
+          $appcmd  = "${{ env.APPCMD_PATH }}"
 
           Write-Host "Current Path: $current"
           Write-Host "Release Path: $release"
 
+          function Invoke-AppPoolCommand {
+              param(
+                  [ValidateSet('stop', 'start')][string]$Action,
+                  [string]$Name
+              )
+
+              $output = & $appcmd $Action apppool "/apppool.name:$Name" 2>&1 | Out-String
+              Write-Host $output.Trim()
+
+              # appcmd exits non-zero, and its own message says so plainly,
+              # for a pool that's already in the requested state - not a
+              # real failure, so it's excluded from the throw below.
+              if ($LASTEXITCODE -ne 0 -and $output -notmatch 'already (stopped|started)') {
+                  throw "appcmd.exe failed to $Action Application Pool '$Name' (exit $LASTEXITCODE): $($output.Trim()) -- This is almost always a Windows permissions problem, not a bug in this workflow: the account running the GitHub Actions runner service must be a member of the local Administrators group on this server to control IIS Application Pools. IIS_IUSRS membership and NTFS folder permissions on $env:BASE_PATH are NOT sufficient for this. See docs/DEPLOYMENT.md §1.8."
+              }
+          }
+
           Write-Host "Stopping Application Pool: $appPool"
-          Stop-WebAppPool -Name $appPool
+          Invoke-AppPoolCommand -Action stop -Name $appPool
 
           $timeout = (Get-Date).AddSeconds(30)
           while ((Get-WebAppPoolState -Name $appPool).Value -ne 'Stopped' -and (Get-Date) -lt $timeout) {
@@ -472,7 +538,7 @@ jobs:
           }
 
           Write-Host "Starting Application Pool: $appPool"
-          Start-WebAppPool -Name $appPool
+          Invoke-AppPoolCommand -Action start -Name $appPool
 
           $timeout = (Get-Date).AddSeconds(30)
           while ((Get-WebAppPoolState -Name $appPool).Value -ne 'Started' -and (Get-Date) -lt $timeout) {
@@ -578,14 +644,22 @@ jobs:
           $current = "${{ env.CURRENT_PATH }}"
           $oldBackup = "${{ env.OLD_BACKUP }}"
           $appPool = "${{ env.IIS_APP_POOL }}"
+          $appcmd  = "${{ env.APPCMD_PATH }}"
 
           if ([string]::IsNullOrWhiteSpace($oldBackup) -or -not (Test-Path $oldBackup)) {
               Write-Warning "No previous backup available to roll back to. Manual intervention required."
               exit 1
           }
 
+          # Same appcmd.exe-based stop/start as Deploy Release, and for the
+          # same reason (see that step's comment) - both non-fatal here,
+          # matching the previous -ErrorAction SilentlyContinue behavior,
+          # since a rollback must still attempt to restore Current even if
+          # the pool was already stopped (or, in the worst case, this same
+          # permissions problem is what triggered the rollback in the first
+          # place).
           Write-Host "Stopping Application Pool: $appPool"
-          Stop-WebAppPool -Name $appPool -ErrorAction SilentlyContinue
+          & $appcmd stop apppool "/apppool.name:$appPool" 2>&1 | ForEach-Object { Write-Host $_ }
           Start-Sleep -Seconds 5
 
           Write-Host "Restoring previous version from: $oldBackup"
@@ -595,7 +669,10 @@ jobs:
           Copy-Item "$oldBackup\*" $current -Recurse -Force
 
           Write-Host "Starting Application Pool: $appPool"
-          Start-WebAppPool -Name $appPool
+          & $appcmd start apppool "/apppool.name:$appPool" 2>&1 | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Application Pool '$appPool' failed to start during rollback - if this is the same 'Access is denied' issue, restoring Current's files still succeeded, but the site will stay down until the permissions problem is fixed and the pool is started manually."
+          }
 
           Write-Host "Rollback complete. Previous stable version restored."
           Write-Host "Failing this job so the failed deployment is visible."

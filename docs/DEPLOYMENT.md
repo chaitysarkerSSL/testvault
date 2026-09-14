@@ -122,13 +122,55 @@ Register a self-hosted Actions runner on this same Windows Server (Settings
 → Actions → Runners → New self-hosted runner in the GitHub repo), running
 as a Windows Service under an account that has:
 
-- Local Administrator rights, or specifically enough to manage IIS
-  (`IIS_IUSRS`/`Administrators` group membership) — needed for
-  `Stop-WebAppPool`/`Start-WebAppPool`.
+- **Local Administrator rights** — see §1.8. This is the one prerequisite
+  that's easy to get wrong: `IIS_IUSRS` membership does **not** substitute
+  for it, however it might look like it should.
 - Write access to `E:\AllWebApplication\TestVault\*`.
 - The .NET 8.0 SDK on `PATH` (this is what `dotnet build`/`publish` runs
   with in the workflow — separate from the Hosting Bundle in §1.1, which
   is what IIS itself uses to *run* the published app).
+
+### 1.8 IIS Application Pool management permissions
+
+The workflow's **Deploy Release** and **Rollback On Failure** steps stop
+and start the `TestVault` Application Pool (via `appcmd.exe`, calling into
+WAS — the Windows Process Activation Service). That specifically requires
+the runner's service account to be a **local Administrator** on this
+server. Two things that look like they should be enough, but aren't:
+
+- **`IIS_IUSRS` group membership** — this is the built-in group IIS puts
+  an application pool's *worker process identity* into (the account the
+  app itself runs as). It carries no rights to *manage* a pool's state.
+- **NTFS permissions on `E:\AllWebApplication\TestVault\`** — this only
+  covers the site's content files. Stopping/starting a pool goes through
+  `applicationHost.config` and WAS, neither of which lives under that path.
+
+Set it up:
+
+```powershell
+# Run as a real local Administrator, not as the runner's own account.
+Add-LocalGroupMember -Group "Administrators" -Member "CICD"
+
+# If the runner's account is a LOCAL (non-domain) account, also disable
+# UAC's remote-token filtering for local admins - otherwise Windows can
+# silently downgrade that account's token to "standard user" for the kind
+# of loopback/COM call Stop-WebAppPool/appcmd's underlying WAS calls make,
+# even though the account genuinely is an Administrator. This is the
+# classic cause of "works when I run it manually, Access is Denied when
+# the same account runs it as a service."
+New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
+    -Name "LocalAccountTokenFilterPolicy" -PropertyType DWord -Value 1 -Force
+
+# Restart the runner service so it picks up a token reflecting the new
+# group membership - a running service keeps the token it started with,
+# so this step is required, not optional, after the change above.
+Get-Service "actions.runner.*" | Restart-Service
+```
+
+Verify by running as the runner's own account (not your own, possibly more
+privileged, interactive session) — `runas /user:CICD "powershell -NoExit
+-Command Stop-WebAppPool -Name TestVault; Start-WebAppPool -Name TestVault"`
+should succeed with no prompt beyond the account's password.
 
 ---
 
@@ -186,11 +228,13 @@ Create Release folder         (Releases\Release_<timestamp>)
    ↓
 dotnet publish -> Release folder
    ↓
-Configure Environment Variables  (injects the 3 secrets into that release's web.config)
+Configure Environment Variables  (sets ASPNETCORE_ENVIRONMENT=Production in that
+                                   release's web.config; reports whether the server-side
+                                   Application Pool config secrets require is present)
    ↓
 Backup Current                (snapshot Current -> Backup\Backup_<timestamp>, skipped if Current is empty)
    ↓
-Deploy Release                (Stop-WebAppPool -> replace Current's contents -> Start-WebAppPool)
+Deploy Release                (appcmd stop apppool -> replace Current's contents -> appcmd start apppool)
    ↓
 Health Check                  (GET /health, GET /api/runs, POST /hubs/run/negotiate)
    ↓
@@ -209,48 +253,87 @@ isn't wired up yet.
 Nothing in this repository ever contains a real connection string, JWT
 secret, or AI API key — `TestVault.Web/appsettings*.json` ship only empty
 placeholders with a `"// NOTE"` explaining that (established back in
-Phases 2/3/6, unchanged here). The workflow's **Configure Environment
-Variables** step is where real values enter the picture, and only there:
+Phases 2/3/6, unchanged here).
 
-1. Configure three **GitHub Actions repository secrets** (Settings →
-   Secrets and variables → Actions → New repository secret):
-   - `TESTVAULT_CONNECTION_STRING` → the real SQL Server connection string.
-   - `TESTVAULT_JWT_SECRET` → a random string, **32+ characters**
-     (`TestVault.Web`'s own startup check refuses to boot otherwise - see
-     Program.cs). Generate one with `openssl rand -base64 32` or
-     `[Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Max 256 }))`
-     in PowerShell. **Different secret per environment** (UAT/production) -
-     a token issued by one must never validate against another.
-   - `TESTVAULT_AI_API_KEY` → the Anthropic API key for AI failure
-     analysis. Optional — if omitted, the app still starts and everything
-     works except `POST /api/analysis/analyze/{id}`, which fails per-request
-     with a 500 (the same graceful-degradation behavior as any other
-     misconfigured external dependency in this app).
+**Production values are configured once on the server, not in GitHub.**
+This repo does **not** use GitHub Actions secrets for
+`ConnectionStrings__DefaultConnection`, `Jwt__Secret`, or `AI__ApiKey` —
+deliberately: `dotnet publish` regenerates a brand-new `web.config` on
+*every single deployment* (see the **Publish Application** step), so
+anything written into it wouldn't survive past the next release anyway,
+and secrets sitting in plaintext inside `Releases\*\web.config` on disk are
+harder to lock down than the alternative below. A value that must persist
+across deployments has to live somewhere `dotnet publish` never touches:
+the **IIS Application Pool itself**.
 
-2. The workflow maps these into the job as `env:` variables on that one
-   step (`DEPLOY_CONNECTION_STRING`, `DEPLOY_JWT_SECRET`,
-   `DEPLOY_AI_API_KEY`) and writes them into the **just-published release's**
-   `web.config`, under `<system.webServer><aspNetCore><environmentVariables>`.
-   This is the standard, documented way to pass environment variables to an
-   in-process ANCM-hosted app — IIS launches the app with these as real
-   process environment variables, and `ConnectionStrings__DefaultConnection`
-   (double underscore = ASP.NET Core configuration's own nested-key
-   separator) is exactly what `TestVault.Web` already expects.
-3. Referencing a secret via `${{ secrets.X }}` anywhere in a job
-   automatically registers it for **log masking** — even an accidental
-   `Write-Host` of one would show as `***` in the Actions log. The workflow
-   doesn't rely on this alone (it never echoes a secret value on purpose
-   either), but it's a real safety net.
-4. The values persist only in: GitHub's encrypted secret store, this one
-   step's process memory during a run, and the deployed `web.config` on
-   the server's disk (inside `Releases\<name>\` and `Current\` -
-   server-local, never inside the git repository, which stops at
-   `E:\AllWebApplication\TestVault`'s absence from any commit).
-5. **Restrict filesystem permissions** on `E:\AllWebApplication\TestVault\`
-   (Releases/Current/Backup all contain `web.config` with live secrets in
-   plaintext) to Administrators + the app pool identity only - anyone else
-   with read access to that path can read the connection string and JWT
-   signing key directly off disk.
+### 4.1 One-time setup: Application Pool environment variables
+
+IIS 10.0 / Windows Server 2016+ supports environment variables scoped to a
+single Application Pool. The ASP.NET Core Module (ANCM) launches `w3wp.exe`
+with these already present in its process environment, so `TestVault.Web`
+picks them up exactly the same way it would from `web.config`'s own
+`<environmentVariables>` — no code or web.config change needed.
+
+```powershell
+Import-Module WebAdministration
+
+$pool = "TestVault_UAT"   # match IIS_APP_POOL in the workflow
+
+foreach ($kv in @{
+    'ConnectionStrings__DefaultConnection' = '<real SQL Server connection string>'
+    'Jwt__Secret'                          = '<random, 32+ characters>'
+    'AI__ApiKey'                           = '<Anthropic API key - optional>'
+}.GetEnumerator()) {
+    Add-WebConfigurationProperty -PSPath 'MACHINE/WEBROOT/APPHOST' `
+        -Filter "system.applicationHost/applicationPools/add[@name='$pool']/environmentVariables" `
+        -Name "." -Value @{ name = $kv.Key; value = $kv.Value }
+}
+
+Restart-WebAppPool -Name $pool
+```
+
+Equivalent GUI path: **IIS Manager → Application Pools → select the pool →
+Configuration Editor** (top-right link) → section
+`system.applicationHost/applicationPools` → locate this pool's entry →
+`environmentVariables` → **Add**.
+
+Generate `Jwt__Secret` with `openssl rand -base64 32` or
+`[Convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Max 256 }))`
+in PowerShell — **32+ characters**, `TestVault.Web`'s own startup check
+(`Program.cs`) refuses to boot otherwise. Use a **different secret per
+environment** (UAT/production) so a token issued by one can never validate
+against another. `AI__ApiKey` is optional — if omitted, the app still
+starts and everything works except `POST /api/analysis/analyze/{id}`, which
+fails per-request with a 500 (the same graceful-degradation behavior as any
+other misconfigured external dependency in this app).
+
+**To rotate a value later**: re-run the `Add-WebConfigurationProperty` call
+for just that key with the new value (or edit it via Configuration Editor),
+then `Restart-WebAppPool`. This is independent of the deployment pipeline —
+no code change, no workflow run, no GitHub secret to update.
+
+### 4.2 What the workflow does with this
+
+The **Configure Environment Variables** step only ever writes
+`ASPNETCORE_ENVIRONMENT=Production` into the newly published release's
+`web.config` (not a secret, identical for every deployment — this is what
+makes `TestVault.Web` load `appsettings.Production.json` at all). It then
+reads back `IIS:\AppPools\<pool>\environmentVariables` and logs, per key,
+whether `ConnectionStrings__DefaultConnection` / `Jwt__Secret` /
+`AI__ApiKey` are present — **informational only, never blocking**. If §4.1
+was skipped, the deployment still proceeds; `TestVault.Web` will fail its
+own startup check (missing `Jwt:Secret`) or fail to reach the database, the
+**Health Check** step will catch that, and **Rollback On Failure** restores
+the previous working release automatically (§5). The step's log is there so
+the actual cause — a missing Application Pool environment variable — is
+visible immediately, rather than only inferable from a failed health check.
+
+### 4.3 Filesystem permissions
+
+Restrict filesystem permissions on `E:\AllWebApplication\TestVault\` to
+Administrators + the app pool identity only. `web.config` in
+`Releases\`/`Current\`/`Backup\` no longer carries secrets, but it's still
+part of the running application and shouldn't be world-readable.
 
 ---
 
@@ -343,8 +426,9 @@ authentication is being enforced as designed. Only a connection failure, a
 - [ ] `TestVault` IIS site created, bound to `Current\`, with a real binding (§1.4).
 - [ ] SQL Server reachable from this server; `Database/schema.sql` and `Database/identity-schema.sql` both applied (§1.5).
 - [ ] Node.js, npm, and Playwright browsers (`npx playwright install`) installed at the path `Playwright:WorkingDirectory` will point to (§1.6).
-- [ ] Self-hosted GitHub Actions runner registered and running as a service on this server, with the .NET 8.0 **SDK** on `PATH` and rights to manage IIS (§1.7).
-- [ ] `TESTVAULT_CONNECTION_STRING`, `TESTVAULT_JWT_SECRET` (32+ chars, unique per environment), and optionally `TESTVAULT_AI_API_KEY` set as GitHub Actions secrets on this repository (§4).
+- [ ] Self-hosted GitHub Actions runner registered and running as a service on this server, with the .NET 8.0 **SDK** on `PATH` (§1.7).
+- [ ] Runner's service account is a **local Administrator** on this server (not just `IIS_IUSRS`), and `LocalAccountTokenFilterPolicy` is set if it's a local account (§1.8) — verify with `runas /user:<account> "powershell -Command Stop-WebAppPool -Name TestVault"`.
+- [ ] `ConnectionStrings__DefaultConnection` and `Jwt__Secret` (32+ chars, unique per environment) set as environment variables on the `TestVault_UAT` Application Pool, and `AI__ApiKey` set if AI failure analysis is used (§4.1). No GitHub Actions secrets are used for these.
 - [ ] Filesystem permissions on `E:\AllWebApplication\TestVault\` restricted to Administrators + the app pool identity (§4).
 
 **Every deployment:**
