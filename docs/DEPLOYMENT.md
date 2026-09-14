@@ -37,13 +37,13 @@ host an ASP.NET Core app at all.
 
 ### 1.2 Create the Application Pool
 
-Name: **`TestVault_UAT`** (matches `IIS_APP_POOL` in the workflow — if you
+Name: **`TestVault`** (matches `IIS_APP_POOL` in the workflow — if you
 use a different name, update the workflow's `env:` block to match).
 
 Via IIS Manager:
 
 1. Application Pools → Add Application Pool.
-2. Name: `TestVault_UAT`.
+2. Name: `TestVault`.
 3. **.NET CLR Version: `No Managed Code`** — this is not optional or
    cosmetic. ANCM hosts the app in-process inside the IIS worker process
    using its own runtime; a pool still configured for classic ASP.NET
@@ -56,9 +56,9 @@ Via PowerShell (equivalent, if you'd rather script it once):
 
 ```powershell
 Import-Module WebAdministration
-New-WebAppPool -Name "TestVault_UAT"
-Set-ItemProperty "IIS:\AppPools\TestVault_UAT" -Name managedRuntimeVersion -Value ""
-Set-ItemProperty "IIS:\AppPools\TestVault_UAT" -Name managedPipelineMode -Value "Integrated"
+New-WebAppPool -Name "TestVault"
+Set-ItemProperty "IIS:\AppPools\TestVault" -Name managedRuntimeVersion -Value ""
+Set-ItemProperty "IIS:\AppPools\TestVault" -Name managedPipelineMode -Value "Integrated"
 ```
 
 ### 1.3 Create the folder structure
@@ -79,7 +79,7 @@ before the very first deployment.)
 
 1. Sites → Add Website.
 2. Site name: **`TestVault`** (matches `IIS_SITE_NAME` in the workflow).
-3. Application pool: `TestVault_UAT`.
+3. Application pool: `TestVault`.
 4. Physical path: `E:\AllWebApplication\TestVault\Current`.
 5. Binding: whatever hostname/port this environment actually uses (e.g.
    `testvault-uat.yourdomain.internal` on port 80/443). This guide
@@ -93,7 +93,7 @@ before the very first deployment.)
    site's actual binding and has **Application Health Check** send the
    matching `Host` header automatically (§6) — no manual step needed here,
    just be aware of it if you ever test with `curl`/a browser directly.
-6. Grant the application pool identity (`IIS AppPool\TestVault_UAT` by
+6. Grant the application pool identity (`IIS AppPool\TestVault` by
    default) **read & execute** on `E:\AllWebApplication\TestVault\Current`
    and everything under it.
 
@@ -265,6 +265,30 @@ secret, or AI API key — `TestVault.Web/appsettings*.json` ship only empty
 placeholders with a `"// NOTE"` explaining that (established back in
 Phases 2/3/6, unchanged here).
 
+Deployment (GitHub Actions) and application secret management (this
+server) are two deliberately separate concerns:
+
+```
+   Old (removed)                      Current
+
+GitHub Secrets                  IIS Server Environment Variables
+      |                                    |
+      v                                    v
+   Deployment                    ASP.NET Core Configuration
+      |                                    |
+      v                                    v
+  web.config                          Application
+```
+
+The old path meant every deployment depended on GitHub Secrets being
+present just to move code — a secret rotation, a missing repo secret, or a
+CI-side masking quirk could all block a deployment that had nothing to do
+with application configuration. The workflow's job is to ship code
+([.github/workflows/testvault-iis-deploy.yml](../.github/workflows/testvault-iis-deploy.yml):
+checkout, build, publish, backup, deploy, restart the App Pool, health
+check) — not to be a secret store. `TestVault.Web`'s configuration is this
+server's responsibility, independent of any given deployment.
+
 **Production values are configured once on the server, not in GitHub.**
 This repo does **not** use GitHub Actions secrets for
 `ConnectionStrings__DefaultConnection`, `Jwt__Secret`, or `AI__ApiKey` —
@@ -287,7 +311,7 @@ picks them up exactly the same way it would from `web.config`'s own
 ```powershell
 Import-Module WebAdministration
 
-$pool = "TestVault_UAT"   # match IIS_APP_POOL in the workflow
+$pool = "TestVault"   # match IIS_APP_POOL in the workflow
 
 foreach ($kv in @{
     'ConnectionStrings__DefaultConnection' = '<real SQL Server connection string>'
@@ -373,7 +397,7 @@ preceding version, or the automatic path itself couldn't run):
 
 ```powershell
 Import-Module WebAdministration
-Stop-WebAppPool -Name "TestVault_UAT"
+Stop-WebAppPool -Name "TestVault"
 
 # Pick the desired backup (or an older Releases\Release_* folder, which is
 # equally valid - both are complete, self-contained deployable copies).
@@ -382,7 +406,7 @@ $restoreFrom = "E:\AllWebApplication\TestVault\Backup\Backup_20260914_1000"
 Get-ChildItem "E:\AllWebApplication\TestVault\Current" -Force | Remove-Item -Recurse -Force
 Copy-Item "$restoreFrom\*" "E:\AllWebApplication\TestVault\Current" -Recurse -Force
 
-Start-WebAppPool -Name "TestVault_UAT"
+Start-WebAppPool -Name "TestVault"
 ```
 
 Then verify manually: `Invoke-WebRequest http://localhost/health`.
@@ -465,14 +489,14 @@ every run):
 **Before the first deployment to a new environment:**
 
 - [ ] .NET 8.0 Hosting Bundle installed (§1.1); `Get-WebGlobalModule -Name AspNetCoreModuleV2` succeeds.
-- [ ] `TestVault_UAT` application pool exists: .NET CLR Version = No Managed Code, Pipeline Mode = Integrated (§1.2).
+- [ ] `TestVault` application pool exists: .NET CLR Version = No Managed Code, Pipeline Mode = Integrated (§1.2).
 - [ ] Folder structure created; app pool identity has read & execute on `Current\` (§1.3–1.4).
 - [ ] `TestVault` IIS site created, bound to `Current\`, with a real binding (§1.4) — Environment Validation now verifies both automatically every run, but confirm once by hand too: `(Get-Website -Name TestVault).physicalPath` and `Get-WebBinding -Name TestVault`.
 - [ ] SQL Server reachable from this server; `Database/schema.sql` and `Database/identity-schema.sql` both applied (§1.5).
 - [ ] Node.js, npm, and Playwright browsers (`npx playwright install`) installed at the path `Playwright:WorkingDirectory` will point to (§1.6).
 - [ ] Self-hosted GitHub Actions runner registered and running as a service on this server, with the .NET 8.0 **SDK** on `PATH` (§1.7).
 - [ ] Runner's service account is a **local Administrator** on this server (not just `IIS_IUSRS`), and `LocalAccountTokenFilterPolicy` is set if it's a local account (§1.8) — verify with `runas /user:<account> "powershell -Command Stop-WebAppPool -Name TestVault"`.
-- [ ] `ConnectionStrings__DefaultConnection` and `Jwt__Secret` (32+ chars, unique per environment) set as environment variables on the `TestVault_UAT` Application Pool, and `AI__ApiKey` set if AI failure analysis is used (§4.1). No GitHub Actions secrets are used for these.
+- [ ] `ConnectionStrings__DefaultConnection` and `Jwt__Secret` (32+ chars, unique per environment) set as environment variables on the `TestVault` Application Pool, and `AI__ApiKey` set if AI failure analysis is used (§4.1). No GitHub Actions secrets are used for these.
 - [ ] Filesystem permissions on `E:\AllWebApplication\TestVault\` restricted to Administrators + the app pool identity (§4).
 
 **Every deployment:**
