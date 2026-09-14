@@ -1,7 +1,10 @@
 name: Deploy TestVault (ASP.NET Core) to IIS
 
 on:
-  # Manual only - see the header note on why `push` isn't wired up yet.
+  push:
+    branches:
+      - main
+
   workflow_dispatch:
     inputs:
       health_url:
@@ -9,38 +12,31 @@ on:
         required: false
         default: ""
 
-# Prevent two deployments from running at the same time.
 concurrency:
   group: testvault-iis-deployment
   cancel-in-progress: false
 
 jobs:
-
   deploy:
 
     runs-on: self-hosted
 
     env:
-
       APP_NAME: TestVault
 
-      # ---- Deployment folder structure ----------------------------------
       BASE_PATH: E:\AllWebApplication\TestVault
       RELEASE_PATH: E:\AllWebApplication\TestVault\Releases
       CURRENT_PATH: E:\AllWebApplication\TestVault\Current
       BACKUP_PATH: E:\AllWebApplication\TestVault\Backup
 
-      # ---- IIS ------------------------------------------------------------
       IIS_SITE_NAME: TestVault
       IIS_APP_POOL: TestVault
 
       BUILD_CONFIGURATION: Release
 
-      # ---- Retention policy ------------------------------------------------
       RELEASES_TO_KEEP: 5
       BACKUPS_TO_KEEP: 5
 
-      # ---- Health check ------------------------------------------------------
       STARTUP_WAIT_SECONDS: 15
       HEALTH_BASE_URL: http://localhost
 
