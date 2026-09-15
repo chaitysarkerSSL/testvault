@@ -291,19 +291,42 @@ app.UseMiddleware<SecurityHeadersMiddleware>();
 var artifactsRoot = app.Configuration["Playwright:WorkingDirectory"];
 if (string.IsNullOrWhiteSpace(artifactsRoot))
 {
-    artifactsRoot = Directory.GetCurrentDirectory();
+    // NOT Directory.GetCurrentDirectory(): under IIS in-process hosting the
+    // OS-level current directory is inherited from the IIS worker process
+    // itself (historically C:\Windows\System32\inetsrv), not this site's
+    // physical path - and the app pool identity has no write access there.
+    // ContentRootPath is always this app's own deployment folder, regardless
+    // of hosting model (Kestrel/dotnet run, IIS in-process, IIS out-of-
+    // process), so it's the only fallback that's actually safe here.
+    artifactsRoot = app.Environment.ContentRootPath;
 }
+
+var startupLogger = app.Services.GetRequiredService<ILogger<Program>>();
 
 foreach (var folder in new[] { "screenshots", "videos", "traces" })
 {
     var physicalPath = Path.Combine(artifactsRoot, folder);
-    Directory.CreateDirectory(physicalPath); // PhysicalFileProvider throws if the root doesn't exist yet
 
-    app.UseStaticFiles(new StaticFileOptions
+    // Non-fatal, matching the Identity-seeding block below: a missing/
+    // inaccessible artifacts directory (wrong Playwright:WorkingDirectory,
+    // restrictive NTFS permissions, disk issues, ...) should degrade to
+    // "screenshot/video/trace links don't work" for that one folder, not
+    // take down every other endpoint in the app - including /health,
+    // which has no dependency on this feature at all.
+    try
     {
-        FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(physicalPath),
-        RequestPath = $"/{folder}"
-    });
+        Directory.CreateDirectory(physicalPath); // PhysicalFileProvider throws if the root doesn't exist yet
+
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(physicalPath),
+            RequestPath = $"/{folder}"
+        });
+    }
+    catch (Exception ex)
+    {
+        startupLogger.LogError(ex, "Failed to prepare the '{Folder}' artifacts folder at '{Path}' - serving it is disabled, but startup will continue. Set Playwright:WorkingDirectory (env var Playwright__WorkingDirectory) to a path the app pool identity can write to.", folder, physicalPath);
+    }
 }
 
 if (app.Environment.IsDevelopment())
