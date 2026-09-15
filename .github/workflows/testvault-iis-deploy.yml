@@ -54,7 +54,7 @@ jobs:
       # ======================================
       # Analyze Project Structure
       # Locate the solution and the actual IIS-hosted web project from the
-      # real repository contents - never hardcoded.
+      # real repository contents - never hardcoded.test
       # ======================================
 
       - name: Analyze Project Structure
