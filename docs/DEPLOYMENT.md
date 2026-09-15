@@ -8,7 +8,8 @@ changes.
 
 **Scope**: this covers deploying `TestVault.Web` (the ASP.NET Core API) to
 IIS. The React frontend (`frontend/`) is a separate static site with its own
-deployment story, out of scope here.
+deployment story, out of scope here. For running `TestVault.Web` on a
+developer machine instead, see [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ---
 

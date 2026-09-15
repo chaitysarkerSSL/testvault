@@ -52,6 +52,27 @@ jobs:
           fetch-depth: 1
 
       # ======================================
+      # Setup .NET SDK
+      #
+      # Pins the exact SDK used to build/publish to what global.json (repo
+      # root) requires, independent of whatever SDK(s) happen to be
+      # installed machine-wide on this self-hosted runner. actions/setup-
+      # dotnet downloads this version into the runner's own per-job tool
+      # cache and prepends it to PATH/DOTNET_ROOT for the steps below - it
+      # does NOT touch or replace any SDK already installed system-wide on
+      # this server (nothing here uninstalls anything), and every later
+      # `dotnet` call in this job (restore/build/publish) additionally
+      # verifies itself against global.json's "sdk"/"version" via normal
+      # SDK resolution, so a mismatch fails loudly instead of silently
+      # building with the wrong toolchain.
+      # ======================================
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.306'
+
+      # ======================================
       # Analyze Project Structure
       # Locate the solution and the actual IIS-hosted web project from the
       # real repository contents - never hardcoded.test

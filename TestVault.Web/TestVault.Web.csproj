@@ -26,6 +26,7 @@
     -->
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <UserSecretsId>2f44046e-373b-4420-bec3-5a8b4a7edfae</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>
