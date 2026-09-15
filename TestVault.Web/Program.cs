@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using TestVault.Application;
@@ -206,6 +207,38 @@ builder.Services.AddHealthChecks();
 
 var app = builder.Build();
 
+// ==========================================================================
+// DEV-ONLY: "forgot the admin password" console command
+// ==========================================================================
+//
+// There is no self-service "forgot password" flow in this app (no email
+// sending - see Phase 6's noted gaps), and the bootstrap admin's initial
+// password is a one-time random value shown only once, in this app's own
+// startup log (IdentitySeeder). Lose it and there is otherwise no way back
+// in short of hand-editing the database - which is exactly the unsafe
+// shortcut this command exists to avoid.
+//
+// This is a CONSOLE COMMAND, not an HTTP endpoint: it runs to completion
+// and the process exits before Kestrel ever starts listening, so there is
+// no route to remember to remove before deploying, and nothing reachable
+// over the network even by accident. It goes through the same UserManager
+// APIs a real self-service reset would use - GeneratePasswordResetTokenAsync
+// then ResetPasswordAsync - so the new password is still validated against
+// Identity's configured password policy (DependencyInjection.cs) and
+// PasswordHash is never touched directly.
+//
+// Gated on IsDevelopment() as defense in depth, independent of how it's
+// invoked - even run by hand against a Production-configured deployment
+// (e.g. someone RDPs into the IIS box and runs the dll directly), it
+// refuses to do anything.
+//
+//   dotnet run -- reset-password <username> <newPassword>
+//
+if (args.Length > 0 && string.Equals(args[0], "reset-password", StringComparison.OrdinalIgnoreCase))
+{
+    return await RunResetPasswordCommandAsync(app, args);
+}
+
 // One-time startup seeding: the three roles, and a bootstrap admin account
 // if the database has no users at all yet - see IdentitySeeder's own doc
 // comment for why this doesn't use a fixed default password.
@@ -293,6 +326,16 @@ app.UseAuthorization();
 
 app.MapControllers();
 
+// TestVault.Web is API-only (no HomeController/Views/wwwroot - the React
+// frontend is a separate app), so "/" never matched any endpoint. With no
+// endpoint to attach [AllowAnonymous] to, the global FallbackPolicy above
+// still applied to the unmatched request and returned 401 instead of
+// letting it fall through to a plain 404. Mapping a trivial anonymous root
+// endpoint gives browsers/load balancers hitting "/" a real 200 without
+// weakening the fallback policy for every other (still-unmapped) route.
+app.MapGet("/", () => Results.Ok(new { service = "TestVault API", status = "running" }))
+    .AllowAnonymous();
+
 // Always anonymous, unlike everything else under the global fallback
 // policy - a deployment health check or load balancer has no bearer token
 // to present, and conventionally never should need one for a liveness probe.
@@ -306,3 +349,50 @@ app.MapHealthChecks("/health").AllowAnonymous();
 app.MapHub<RunHub>("/hubs/run");
 
 app.Run();
+return 0;
+
+// See the "DEV-ONLY" block above for why this exists and why it's a
+// console command rather than a controller action.
+static async Task<int> RunResetPasswordCommandAsync(WebApplication app, string[] args)
+{
+    if (!app.Environment.IsDevelopment())
+    {
+        Console.Error.WriteLine("reset-password is a development-only tool and is disabled outside the Development environment.");
+        return 1;
+    }
+
+    if (args.Length != 3)
+    {
+        Console.Error.WriteLine("Usage: dotnet run -- reset-password <username> <newPassword>");
+        return 1;
+    }
+
+    var username = args[1];
+    var newPassword = args[2];
+
+    using var scope = app.Services.CreateScope();
+    var userManager = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+
+    var user = await userManager.FindByNameAsync(username);
+    if (user is null)
+    {
+        Console.Error.WriteLine($"No user named '{username}' was found.");
+        return 1;
+    }
+
+    var resetToken = await userManager.GeneratePasswordResetTokenAsync(user);
+    var result = await userManager.ResetPasswordAsync(user, resetToken, newPassword);
+
+    if (!result.Succeeded)
+    {
+        Console.Error.WriteLine("Password reset failed:");
+        foreach (var error in result.Errors)
+        {
+            Console.Error.WriteLine($" - {error.Description}");
+        }
+        return 1;
+    }
+
+    Console.WriteLine($"Password for '{username}' has been reset successfully.");
+    return 0;
+}
