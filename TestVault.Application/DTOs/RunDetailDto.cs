@@ -20,7 +20,7 @@ public class RunDetailDto
     public TriggeredBy TriggeredBy { get; set; }
     public string Environment { get; set; } = string.Empty;
     public string Browser { get; set; } = string.Empty;
-    public RunStatus Status { get; set; }
+    public string Status { get; set; } = string.Empty;
     public DateTime StartedAt { get; set; }
     public DateTime? FinishedAt { get; set; }
     public long? DurationMs { get; set; }

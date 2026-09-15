@@ -15,11 +15,16 @@ namespace TestVault.Infrastructure.Repositories;
 /// is a near-verbatim port of the corresponding query in
 /// backend/routes/runs.js - see each method's XML doc for the exact source.
 ///
-/// test_runs.status, .triggered_by are plain VARCHAR columns; Dapper maps
-/// them directly onto the RunStatus/TriggeredBy enum properties via
+/// test_runs.status, .triggered_by are plain VARCHAR columns. .triggered_by
+/// maps onto the closed, app-controlled TriggeredBy enum via Dapper's
 /// case-insensitive name matching (verified empirically against a live
-/// Dapper query before writing this), so no manual string&lt;-&gt;enum
-/// conversion is needed here.
+/// Dapper query before writing this). .status is intentionally mapped onto
+/// TestRun.Status as a plain string, not an enum - it has no CHECK
+/// constraint and this is a test-execution system where new statuses are
+/// expected over time (queued/running/passed/failed/aborted/cancelled/
+/// timeout/skipped/retrying, ...); a DB value with no matching enum member
+/// makes Dapper throw (this previously crashed GetRunListAsync/
+/// GetRunDetailAsync on any row with status = 'aborted').
 /// </summary>
 public class RunsRepository : IRunsRepository
 {

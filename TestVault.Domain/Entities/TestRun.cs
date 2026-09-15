@@ -34,7 +34,18 @@ public class TestRun
     /// <summary>Playwright project name, e.g. "chromium".</summary>
     public string Browser { get; set; } = string.Empty;
 
-    public RunStatus Status { get; set; }
+    /// <summary>
+    /// Lifecycle status of the run - "running", "passed", "failed", "aborted",
+    /// etc. Backed by test_runs.status (VARCHAR(20), no CHECK constraint) and
+    /// kept as a plain string rather than an enum specifically because this
+    /// is a test-execution system whose set of statuses is expected to grow
+    /// (e.g. "cancelled", "timeout", "retrying") - Dapper would throw
+    /// ArgumentException on any DB value without a matching enum member (this
+    /// is exactly what happened for "aborted"), which a string column can
+    /// never do. Compare/switch on the string value; there is no fixed set
+    /// of allowed statuses to enumerate here.
+    /// </summary>
+    public string Status { get; set; } = string.Empty;
 
     /// <summary>Audit field: when the run was created. Always set (DB default).</summary>
     public DateTime StartedAt { get; set; }
